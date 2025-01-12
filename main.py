@@ -27,41 +27,50 @@ PROCESSED_POSTS = set()  # Здесь будут храниться ID уже о
 # Функция для парсинга одного поста
 def parse_post(post):
     post_content = []
-    # Парсинг текста
-    for span in post.find_all("span"):
-        text = span.get_text(strip=True)
-        if text:
-            post_content.append(text + "\n")
+    processed_images = set()
 
-    # Парсинг изображений
-    for image in post.find_all("div", class_="image"):
-        img_tag = image.find("img")
-        if img_tag:
-            img_url = img_tag.get("src")
-            title = img_tag.get("title", "Нет тегов")
-            post_content.append(f"Изображение: {img_url} (Теги: {title})\n")
+    # Работаем с текстом (<span>)
+    for span_tag in post.find_all('span'):
+        span_text = span_tag.get_text(strip=True)
+        if span_text:
+            post_content.append(f"Текст: {span_text}")
 
-    # Парсинг увеличиваемых изображений
-    for zoomed_image in post.find_all("div", class_="image zoomed-image"):
-        a_tag = zoomed_image.find("a")
-        if a_tag:
-            img_url = a_tag.get("href")
-            title = a_tag.find("img").get("alt", "Нет тегов")
-            post_content.append(f"Увеличиваемое изображение: {img_url} (Теги: {title})\n")
+    # Работаем с <div class="image zoomed-image">
+    for zoomed_img_div in post.find_all('div', class_='image zoomed-image'):
+        a_tag = zoomed_img_div.find('a')
+        if a_tag and a_tag.get('href'):
+            img_url = a_tag['href']
+            img_name = img_url.split('/')[-1]
+            if img_name not in processed_images:
+                post_content.append(f"Увеличиваемая картинка: {img_url}")
+                processed_images.add(img_name)
 
-    # Парсинг ссылок
-    for a_tag in post.find_all("a", href=True):
-        link_text = a_tag.get_text(strip=True)
-        link_url = a_tag["href"]
-        if link_text:
-            post_content.append(f"Ссылка: {link_text} ({link_url})\n")
+    # Работаем с <div class="image">
+    for img_div in post.find_all('div', class_='image'):
+        img_tag = img_div.find('img')
+        if img_tag and img_tag.get('src'):
+            img_url = img_tag['src']
+            img_name = img_url.split('/')[-1]
+            if img_name not in processed_images:
+                post_content.append(f"Картинка: {img_url}")
+                processed_images.add(img_name)
 
-    # Парсинг видео
-    for video in post.find_all("video"):
-        video_url = video.get("data-src")
-        title = video.get("title", "Нет тегов")
-        if video_url:
-            post_content.append(f"Видео: {video_url} (Теги: {title})\n")
+    # Работаем с <a> (ссылки)
+    for a_tag in post.find_all('a'):
+        span_text = a_tag.find('span').get_text(strip=True) if a_tag.find('span') else None
+        if span_text:
+            post_content.append(f"Ссылка: {span_text} ({a_tag['href']})")
+
+    # Работаем с видео
+    for video_div in post.find_all('div', class_='ant-spin-nested-loading'):
+        video_tag = video_div.find('video')
+        if video_tag and video_tag.get('data-src'):
+            post_content.append(f"Видео: {video_tag['data-src']}")
+
+    for single_div in post.find_all('div', class_='single'):
+        video_tag = single_div.find('video')
+        if video_tag and video_tag.get('data-src'):
+            post_content.append(f"Видео: {video_tag['data-src']}")
 
     return post_content
 
