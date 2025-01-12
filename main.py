@@ -5,118 +5,101 @@
 #<div class="single"> контент с видео
 #    < video data - src = ссылка на видео
 #    title= теги
+import asyncio
 
 from bs4 import BeautifulSoup
 import requests
+import time
+import telegram
 
-def parse_joyreactor():
-    # URL сайта
-    url = "https://joyreactor.cc/"
+# токен Telegram-бота и ID чата
+TELEGRAM_BOT_TOKEN = "7829262663:AAGNdKgCWpzsFtyVFinxuGsT8TeE1bexf34"
+CHAT_ID = "-1001251629343"
 
-    # Отправляем GET-запрос
-    response = requests.get(url)
-    response.raise_for_status()  # Проверка на ошибки
+# Инициализация бота
+bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Парсим содержимое страницы
-    soup = BeautifulSoup(response.text, 'html.parser')
-
-    # Находим все посты
-    posts = soup.find_all('div', class_='post-content')
-    print(posts)
-
-    # Обрабатываем каждый пост
-    parsed_posts = []
-    for post in posts:
-        post_content = []
-
-        processed_images = set()  # Для отслеживания уже обработанных изображений по имени файла
-
-        # Работаем с <div class="image zoomed-image">
-        for zoomed_img_div in post.find_all('div', class_='image zoomed-image'):
-            a_tag = zoomed_img_div.find('a')
-            if a_tag and a_tag.get('href'):
-                img_url = a_tag['href']
-                img_name = img_url.split('/')[-1]  # Получаем имя файла
-                if img_name not in processed_images:
-                    post_content.append({
-                        'type': 'zoomed_image',
-                        'url': img_url,
-                        'tags': a_tag.find('img').get('alt', 'Нет тегов') if a_tag.find('img') else 'Нет тегов'
-                    })
-                    processed_images.add(img_name)  # Помечаем имя файла как обработанное
-
-        # Работаем с <div class="image">
-        for img_div in post.find_all('div', class_='image'):
-            img_tag = img_div.find('img')
-            if img_tag and img_tag.get('src'):
-                img_url = img_tag['src']
-                img_name = img_url.split('/')[-1]  # Получаем имя файла
-                if img_name not in processed_images:  # Проверяем, обработано ли изображение
-                    post_content.append({
-                        'type': 'image',
-                        'url': img_url,
-                        'tags': img_tag.get('title', 'Нет тегов')
-                    })
-                    processed_images.add(img_name)  # Помечаем имя файла как обработанное
+# URL сайта
+BASE_URL = "https://joyreactor.cc/"
+PROCESSED_POSTS = set()  # Здесь будут храниться ID уже отправленных постов
 
 
-        # Работаем с <a> (ссылки)
-        for a_tag in post.find_all('a'):
-            span_text = a_tag.find('span').get_text(strip=True) if a_tag.find('span') else None
-            if span_text:
-                post_content.append({
-                    'type': 'link',
-                    'url': a_tag['href'],
-                    'text': span_text
-                })
+# Функция для парсинга одного поста
+def parse_post(post):
+    post_content = []
+    # Парсинг текста
+    for span in post.find_all("span"):
+        text = span.get_text(strip=True)
+        if text:
+            post_content.append(text + "\n")
 
-        # Работаем с видео
-        for video_div in post.find_all('div', class_='ant-spin-nested-loading'):
-            video_tag = video_div.find('video')
-            if video_tag and video_tag.get('data-src'):
-                post_content.append({
-                    'type': 'video',
-                    'url': video_tag['data-src'],
-                    'tags': video_tag.get('title', 'Нет тегов')
-                })
+    # Парсинг изображений
+    for image in post.find_all("div", class_="image"):
+        img_tag = image.find("img")
+        if img_tag:
+            img_url = img_tag.get("src")
+            title = img_tag.get("title", "Нет тегов")
+            post_content.append(f"Изображение: {img_url} (Теги: {title})\n")
 
-        for single_div in post.find_all('div', class_='single'):
-            video_tag = single_div.find('video')
-            if video_tag and video_tag.get('data-src'):
-                post_content.append({
-                    'type': 'video',
-                    'url': video_tag['data-src'],
-                    'tags': video_tag.get('title', 'Нет тегов')
-                })
+    # Парсинг увеличиваемых изображений
+    for zoomed_image in post.find_all("div", class_="image zoomed-image"):
+        a_tag = zoomed_image.find("a")
+        if a_tag:
+            img_url = a_tag.get("href")
+            title = a_tag.find("img").get("alt", "Нет тегов")
+            post_content.append(f"Увеличиваемое изображение: {img_url} (Теги: {title})\n")
 
-        # Работаем с текстом (<span>)
-        for span_tag in post.find_all('span'):
-            span_text = span_tag.get_text(strip=True)
-            if span_text:
-                post_content.append({
-                    'type': 'text',
-                    'content': span_text
-                })
+    # Парсинг ссылок
+    for a_tag in post.find_all("a", href=True):
+        link_text = a_tag.get_text(strip=True)
+        link_url = a_tag["href"]
+        if link_text:
+            post_content.append(f"Ссылка: {link_text} ({link_url})\n")
 
-        parsed_posts.append(post_content)
+    # Парсинг видео
+    for video in post.find_all("video"):
+        video_url = video.get("data-src")
+        title = video.get("title", "Нет тегов")
+        if video_url:
+            post_content.append(f"Видео: {video_url} (Теги: {title})\n")
 
-    return parsed_posts
+    return post_content
 
-# Выводим результаты
-posts_data = parse_joyreactor()
-for i, post in enumerate(posts_data, start=1):
-    print(f"Пост {i}:")
-    for content in post:
-        if content['type'] == 'image':
-            print(f"Картинка: {content['url']} (Теги: {content['tags']})")
-        elif content['type'] == 'zoomed_image':
-            print(f"Увеличиваемая картинка: {content['url']} (Теги: {content['tags']})")
-        elif content['type'] == 'link':
-            print(f"Ссылка: {content['url']} (Текст: {content['text']})")
-        elif content['type'] == 'video':
-            print(f"Видео: {content['url']} (Теги: {content['tags']})")
-        elif content['type'] == 'text':
-            print(f"Текст: {content['content']}")
-    print("-" * 40)
 
-print(posts_data)
+# Функция для отправки сообщения в Telegram
+async def send_to_telegram(post_content):
+    message = "\n".join(post_content)
+    if message.strip():
+        await bot.send_message(chat_id=CHAT_ID, text=message)
+        print("Сообщение отправлено")
+
+
+# Основной цикл для проверки новых постов
+async def monitor_website():
+    while True:
+        try:
+            response = requests.get(BASE_URL)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                posts = soup.find_all("div", class_="post-content")
+
+                for post in posts:
+                    post_id = hash(str(post))  # Уникальный идентификатор поста
+                    if post_id not in PROCESSED_POSTS:
+                        PROCESSED_POSTS.add(post_id)
+                        post_content = parse_post(post)
+                        await send_to_telegram(post_content)
+
+            else:
+                print(f"Ошибка загрузки сайта: {response.status_code}")
+
+        except Exception as e:
+            print(f"Ошибка: {e}")
+
+        # Задержка перед следующей проверкой
+        await asyncio.sleep(60)  # Проверяем каждые 60 секунд
+
+
+# Запуск программы
+if __name__ == "__main__":
+    asyncio.run(monitor_website())
