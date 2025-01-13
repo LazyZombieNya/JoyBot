@@ -10,14 +10,15 @@ import asyncio
 from bs4 import BeautifulSoup
 import requests
 import time
-import telegram
+from telegram import Bot, InputMediaPhoto, InputMediaVideo
+
 
 # токен Telegram-бота и ID чата
 TELEGRAM_BOT_TOKEN = "7829262663:AAGNdKgCWpzsFtyVFinxuGsT8TeE1bexf34"
 CHAT_ID = "-1001251629343"
 
 # Инициализация бота
-bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # URL сайта
 BASE_URL = "https://joyreactor.cc/"
@@ -26,14 +27,15 @@ PROCESSED_POSTS = set()  # Здесь будут храниться ID уже о
 
 # Функция для парсинга одного поста
 def parse_post(post):
-    post_content = []
+    text_content = []
+    media_content = []
     processed_images = set()
 
     # Работаем с текстом (<span>)
-    for span_tag in post.find_all('span'):
-        span_text = span_tag.get_text(strip=True)
-        if span_text:
-            post_content.append(f"Текст: {span_text}")
+    for span in post.find_all('span'):
+        text = span.get_text(strip=True)
+        if text:
+            text_content.append(text+"\n")
 
     # Работаем с <div class="image zoomed-image">
     for zoomed_img_div in post.find_all('div', class_='image zoomed-image'):
@@ -41,8 +43,9 @@ def parse_post(post):
         if a_tag and a_tag.get('href'):
             img_url = a_tag['href']
             img_name = img_url.split('/')[-1]
+            title = a_tag.find("img").get("alt", "Нет описания")
             if img_name not in processed_images:
-                post_content.append(f"Увеличиваемая картинка: {img_url}")
+                media_content.append((img_url, "photo", title))
                 processed_images.add(img_name)
 
     # Работаем с <div class="image">
@@ -51,36 +54,58 @@ def parse_post(post):
         if img_tag and img_tag.get('src'):
             img_url = img_tag['src']
             img_name = img_url.split('/')[-1]
+            title = img_tag.get("title", "Нет описания")
             if img_name not in processed_images:
-                post_content.append(f"Картинка: {img_url}")
+                media_content.append((img_url, "photo", title))
                 processed_images.add(img_name)
 
     # Работаем с <a> (ссылки)
     for a_tag in post.find_all('a'):
+        href_url = a_tag['href']
         span_text = a_tag.find('span').get_text(strip=True) if a_tag.find('span') else None
         if span_text:
-            post_content.append(f"Ссылка: {span_text} ({a_tag['href']})")
+            text_content.append(href_url+"\n")
 
     # Работаем с видео
-    for video_div in post.find_all('div', class_='ant-spin-nested-loading'):
-        video_tag = video_div.find('video')
-        if video_tag and video_tag.get('data-src'):
-            post_content.append(f"Видео: {video_tag['data-src']}")
+    for video_div in post.find_all('div', class_='video'):
+        video_url = video_div.get("data-src")
+        title = video_div.get("title", "Нет описания")
+        if video_url:
+            media_content.append((video_url, "video", title))
 
-    for single_div in post.find_all('div', class_='single'):
-        video_tag = single_div.find('video')
-        if video_tag and video_tag.get('data-src'):
-            post_content.append(f"Видео: {video_tag['data-src']}")
-
-    return post_content
+    return text_content, media_content
 
 
 # Функция для отправки сообщения в Telegram
-async def send_to_telegram(post_content):
-    message = "\n".join(post_content)
+#async def send_to_telegram(post_content):
+#    message = "\n".join(post_content)
+#    print(post_content)
+#    if message.strip():
+#        await bot.send_message(chat_id=CHAT_ID, text=message)
+#        #bot.sendMediaGroup
+#        print("Сообщение отправлено")
+
+# Функция для отправки текста в Telegram
+async def send_text_to_telegram(text_content):
+    message = "".join(text_content)
     if message.strip():
         await bot.send_message(chat_id=CHAT_ID, text=message)
-        print("Сообщение отправлено")
+        print("Текстовое сообщение отправлено")
+
+
+# Функция для отправки медиа-группы в Telegram
+async def send_media_group(chat_id, media_content):
+    media_group = []
+
+    for url, media_type, caption in media_content:
+        if media_type == "photo":
+            media_group.append(InputMediaPhoto(media=url, caption=caption))
+        elif media_type == "video":
+            media_group.append(InputMediaVideo(media=url, caption=caption))
+
+    if media_group:
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
+        print("Медиа-группа отправлена")
 
 
 # Основной цикл для проверки новых постов
@@ -96,8 +121,16 @@ async def monitor_website():
                     post_id = hash(str(post))  # Уникальный идентификатор поста
                     if post_id not in PROCESSED_POSTS:
                         PROCESSED_POSTS.add(post_id)
-                        post_content = parse_post(post)
-                        await send_to_telegram(post_content)
+                        text_content, media_content = parse_post(post)
+                        #post_content = parse_post(post)
+
+                        # Отправляем текст
+                        if text_content:
+                            await send_text_to_telegram(text_content)
+
+                        # Отправляем медиа
+                        if media_content:
+                            await send_media_group(chat_id=CHAT_ID, media_content=media_content)
 
             else:
                 print(f"Ошибка загрузки сайта: {response.status_code}")
