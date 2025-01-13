@@ -19,7 +19,7 @@ CHAT_ID = "-1001251629343"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # URL сайта
-BASE_URL = "https://joyreactor.cc/new"
+BASE_URL = "https://joy.reactor.cc/all"
 PROCESSED_POSTS = set()  # Здесь будут храниться ID уже отправленных постов
 
 # Функция для парсинга одного поста
@@ -47,13 +47,14 @@ def parse_post(post):
 
     # Работаем с <div class="image">
     for img_div in post.find_all('div', class_='image'):
-        img_tag = img_div.find('img')
-        if img_tag and img_tag.get('src'):
-            img_url = img_tag['src']
+        img_tag = img_div.find('a')
+        if img_tag and img_tag.get('href'):
+            img_url = img_tag['href']
             img_name = img_url.split('/')[-1]
-            title = img_tag.get("title", "Нет описания")
+            print("Image: "+img_url)
+            title = img_tag.find("img").get("alt", "Нет описания")
             if img_name not in processed_images:
-                media_content.append((img_url, "photo", title))
+                media_content.append(("https:"+img_url, "photo", title))
                 processed_images.add(img_name)
 
     # Работаем с <a> (ссылки)
@@ -101,10 +102,11 @@ async def monitor_website():
             response = requests.get(BASE_URL)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
-                posts = soup.find_all("div", class_="post-content")
+                posts = soup.find_all("div", class_="postContainer")
                 print(posts)
                 for post in posts:
-                    post_id = hash(str(post))  # Уникальный идентификатор поста
+                    post_id = post.get("id")  # Уникальный идентификатор поста
+                    print(post_id)
                     if post_id not in PROCESSED_POSTS:
                         PROCESSED_POSTS.add(post_id)
                         text_content, media_content = parse_post(post)
@@ -117,7 +119,7 @@ async def monitor_website():
                         # Отправляем медиа
                         if media_content:
                             await send_media_group(chat_id=CHAT_ID, media_content=media_content)
-                    print(post_id)
+
             else:
                 print(f"Ошибка загрузки сайта: {response.status_code}")
 
