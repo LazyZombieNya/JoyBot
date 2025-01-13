@@ -6,10 +6,8 @@
 #    < video data - src = ссылка на видео
 #    title= теги
 import asyncio
-
 from bs4 import BeautifulSoup
 import requests
-import time
 from telegram import Bot, InputMediaPhoto, InputMediaVideo
 
 
@@ -21,9 +19,8 @@ CHAT_ID = "-1001251629343"
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # URL сайта
-BASE_URL = "https://joyreactor.cc/"
+BASE_URL = "https://joyreactor.cc/new"
 PROCESSED_POSTS = set()  # Здесь будут храниться ID уже отправленных постов
-
 
 # Функция для парсинга одного поста
 def parse_post(post):
@@ -64,26 +61,16 @@ def parse_post(post):
         href_url = a_tag['href']
         span_text = a_tag.find('span').get_text(strip=True) if a_tag.find('span') else None
         if span_text:
-            text_content.append(href_url+"\n")
+            text_content.append("["+span_text+"]("+href_url+")\n")
 
     # Работаем с видео
-    for video_div in post.find_all('div', class_='video'):
+    for video_div in post.find_all('video'):
         video_url = video_div.get("data-src")
         title = video_div.get("title", "Нет описания")
         if video_url:
             media_content.append((video_url, "video", title))
 
     return text_content, media_content
-
-
-# Функция для отправки сообщения в Telegram
-#async def send_to_telegram(post_content):
-#    message = "\n".join(post_content)
-#    print(post_content)
-#    if message.strip():
-#        await bot.send_message(chat_id=CHAT_ID, text=message)
-#        #bot.sendMediaGroup
-#        print("Сообщение отправлено")
 
 # Функция для отправки текста в Telegram
 async def send_text_to_telegram(text_content):
@@ -107,7 +94,6 @@ async def send_media_group(chat_id, media_content):
         await bot.send_media_group(chat_id=chat_id, media=media_group)
         print("Медиа-группа отправлена")
 
-
 # Основной цикл для проверки новых постов
 async def monitor_website():
     while True:
@@ -116,7 +102,7 @@ async def monitor_website():
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
                 posts = soup.find_all("div", class_="post-content")
-
+                print(posts)
                 for post in posts:
                     post_id = hash(str(post))  # Уникальный идентификатор поста
                     if post_id not in PROCESSED_POSTS:
@@ -131,7 +117,7 @@ async def monitor_website():
                         # Отправляем медиа
                         if media_content:
                             await send_media_group(chat_id=CHAT_ID, media_content=media_content)
-
+                    print(post_id)
             else:
                 print(f"Ошибка загрузки сайта: {response.status_code}")
 
