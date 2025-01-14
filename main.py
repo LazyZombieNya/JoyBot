@@ -26,36 +26,45 @@ PROCESSED_POSTS = set()  # Здесь будут храниться ID уже о
 def parse_post(post):
     text_content = []
     media_content = []
-    processed_images = set()
+    processed_images = set() #
 
-    # Работаем с текстом (<span>)
-    for span in post.find_all('span'):
-        text = span.get_text(strip=True)
+    # Работаем с текстом (H3)
+    for H3 in post.find_all('H3'):
+        text = H3.get_text(strip=True)
         if text:
             text_content.append(text+"\n")
 
-    # Работаем с <div class="image zoomed-image">
-    for zoomed_img_div in post.find_all('div', class_='image zoomed-image'):
-        a_tag = zoomed_img_div.find('a')
-        if a_tag and a_tag.get('href'):
-            img_url = a_tag['href']
-            img_name = img_url.split('/')[-1]
-            title = a_tag.find("img").get("alt", "Нет описания")
-            if img_name not in processed_images:
-                media_content.append((img_url, "photo", title))
-                processed_images.add(img_name)
+    # Работаем с текстом (p)
+    for p in post.find_all('p'):
+        text = p.get_text(strip=True)
+        if text:
+            text_content.append(text + "\n")
 
-    # Работаем с <div class="image">
-    for img_div in post.find_all('div', class_='image'):
-        img_tag = img_div.find('a')
-        if img_tag and img_tag.get('href'):
-            img_url = img_tag['href']
-            img_name = img_url.split('/')[-1]
-            print("Image: "+img_url)
-            title = img_tag.find("img").get("alt", "Нет описания")
-            if img_name not in processed_images:
-                media_content.append(("https:"+img_url, "photo", title))
-                processed_images.add(img_name)
+    # Работаем с <div class="prettyPhotoLink">
+    for img_div in post.find_all('a', class_='prettyPhotoLink'):
+        img_url = img_div.get('href')
+        img_name = img_url.split('/')[-1]
+        title = img_div.find("img").get("alt", "Нет описания")
+        if img_name not in processed_images:
+            media_content.append(("https:"+img_url, "photo", title))
+            processed_images.add(img_name)
+
+    # Работаем с <span class="video_holder">
+    for video_span in post.find_all('span', class_='video_holder'):
+        source_tag = video_span.find('source')
+        if source_tag and source_tag.get('src'):
+            img_url = video_span['src']
+
+        print ('img_url '+img_url)
+        img_name = img_url.split('/')[-1]
+        title = video_span.find("img").get("alt", "Нет описания")
+        if img_name not in processed_images:
+            media_content.append(("https:" + img_url, "photo", title))
+            processed_images.add(img_name)
+
+            a_tag = zoomed_img_div.find('a')
+            if a_tag and a_tag.get('href'):
+                img_url = a_tag['href']
 
     # Работаем с <a> (ссылки)
     for a_tag in post.find_all('a'):
@@ -66,6 +75,13 @@ def parse_post(post):
 
     # Работаем с видео
     for video_div in post.find_all('video'):
+        video_url = video_div.get("data-src")
+        title = video_div.get("title", "Нет описания")
+        if video_url:
+            media_content.append((video_url, "video", title))
+
+    # Работаем с видео гиф
+    for video_div in post.find_all('video_gif_source'):
         video_url = video_div.get("data-src")
         title = video_div.get("title", "Нет описания")
         if video_url:
@@ -106,7 +122,6 @@ async def monitor_website():
                 print(posts)
                 for post in posts:
                     post_id = post.get("id")  # Уникальный идентификатор поста
-                    print(post_id)
                     if post_id not in PROCESSED_POSTS:
                         PROCESSED_POSTS.add(post_id)
                         text_content, media_content = parse_post(post)
