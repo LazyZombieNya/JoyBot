@@ -5,6 +5,7 @@ from telegram.constants import ParseMode
 from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.request import HTTPXRequest
 import time
+import mimetypes
 
 
 # токен Telegram-бота и ID чата
@@ -19,9 +20,10 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)# Увеличенный т�
 
 # URL сайта
 BASE_URL = "https://joy.reactor.cc/new"
-#BASE_URL = "https://joy.reactor.cc/post/5880111"
+#BASE_URL = "https://joy.reactor.cc/post/6010465"
 #BASE_URL = "https://joy.reactor.cc/post/6008824"
 PROCESSED_POSTS = set()  # Здесь будут храниться ID уже отправленных постов
+not_fully_processed_post = set()  # ID не до конца обработанных постов из-за ошибки
 
 # Функция для парсинга одного поста
 def parse_post(post):
@@ -29,6 +31,7 @@ def parse_post(post):
     media_content = []
     h2_text="" #теги поста
     processed_images = set() #Список отправленных картинок
+
 
     #print(post)
 
@@ -55,14 +58,19 @@ def parse_post(post):
 
     # Работаем с <div class="prettyPhotoLink">
     for img_div in post.find_all('a', class_='prettyPhotoLink'):
-        img_url_full = img_div.get('href')
-        img_url=img_url_full.replace("/full/", "/")
+        img_url = img_div.get('href')
+        #img_url=img_url_full.replace("/full/", "/")
         img_name = img_url.split('/')[-1]
         if h2_text:
             title=h2_text
         else:
             title = img_div.find("img").get("alt", "Нет тегов")
         if img_name not in processed_images:
+            mime_type, _ = mimetypes.guess_type("https:"+img_url)
+            if mime_type and mime_type.startswith('image'):
+                print("Ссылка корректна для изображения.")
+            else:
+                print("Ссылка не ведет непосредственно к изображению.")
             media_content.append(("https:"+img_url, "photo", title))
             processed_images.add(img_name)
 
@@ -129,7 +137,7 @@ async def send_link_to_telegram(link):
 # Функция для отправки медиа-группы в Telegram
 async def send_media_group(chat_id, post_id, media_content):
     MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
-    link_post = f'\n<a href="https://joy.reactor.cc/post/{post_id}">Пост {post_id}</a>'
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '
 
 
     # Ограничение размера группы перед отправкой
@@ -146,10 +154,12 @@ async def send_media_group(chat_id, post_id, media_content):
 
         for url, media_type, caption in batch:
             if media_type == "photo":
-                photo_group.append(InputMediaPhoto(media=url, caption=(caption+link_post if not photo_group else None), parse_mode="HTML"))#caption только на первую картинку, так описание к группе будет
+                if post_id in not_fully_processed_post:
+                    url = url.replace("/full/", "/")
+                photo_group.append(InputMediaPhoto(media=url, caption=(link_post+caption if not photo_group else None), parse_mode="HTML"))#caption только на первую картинку, так описание к группе будет
             elif media_type == "video":
-                await bot.send_video(chat_id=chat_id,video=url, caption=caption+link_post, parse_mode="HTML")
-            #print(url)
+                await bot.send_video(chat_id=chat_id,video=url, caption=link_post+caption, parse_mode="HTML")
+            print(url)
 
         if photo_group:
             await bot.send_media_group(chat_id=chat_id, media=photo_group)
@@ -160,6 +170,7 @@ async def send_media_group(chat_id, post_id, media_content):
 
 # Основной цикл для проверки новых постов
 async def monitor_website():
+    post_id=0
     while True:
         try:
             response = requests.get(BASE_URL)
@@ -174,23 +185,30 @@ async def monitor_website():
                         print(post_id)
                         text_content, media_content= parse_post(post)
 
+                        # Отправляем медиа
+                        if media_content:
+                            print(media_content)
+
+                            print(not_fully_processed_post)
+                            await send_media_group(chat_id=CHAT_ID, post_id=post_id,media_content=media_content)
+                            not_fully_processed_post.discard(post_id)
+
                         # Отправляем текст
                         if text_content:
                             await send_text_to_telegram(text_content)
 
-                        # Отправляем медиа
-                        if media_content:
-                            await send_media_group(chat_id=CHAT_ID, post_id=post_id,media_content=media_content)
-
                         #if link:
                          #   await send_link_to_telegram(link)
-                        PROCESSED_POSTS.add(post_id) #помечаем что пост отправлен
 
+                        PROCESSED_POSTS.add(post_id) #помечаем что пост отправлен
             else:
                 print(f"Ошибка загрузки сайта: {response.status_code}")
 
         except Exception as e:
             print(f"Ошибка: {e}")
+            print(post_id)
+            not_fully_processed_post.add(post_id)
+
 
         # Задержка перед следующей проверкой
         await asyncio.sleep(60)  # Проверяем каждые 60 секунд
