@@ -64,7 +64,7 @@ def parse_post(post):
         img_name = img_url.split('/')[-1]
         if h2_text:
             if text_content and (sum(len(text) for text in text_content)+len(h2_text))<LIMIT_CAPTION:
-                title = h2_text + "".join(text_content)
+                title = h2_text +"\n"+ "".join(text_content)
             else:
                 title=h2_text
         else:
@@ -87,7 +87,7 @@ def parse_post(post):
                 img_name = img_url.split('/')[-1]
                 if h2_text:
                     if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
-                        title = h2_text + "".join(text_content)
+                        title = h2_text +"\n"+ "".join(text_content)
                         text_content.clear()
                     else:
                         title = h2_text
@@ -105,7 +105,7 @@ def parse_post(post):
         check_video_url("https:" +video_url)
         if h2_text:
             if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
-                title = h2_text + "".join(text_content)
+                title = h2_text +"\n"+ "".join(text_content)
                 text_content.clear()
             else:
                 title = h2_text
@@ -118,7 +118,7 @@ def parse_post(post):
         gif_url = gif_a.get('href')
         if h2_text:
             if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
-                title = h2_text + "".join(text_content)
+                title = h2_text + "\n"+"".join(text_content)
                 text_content.clear()
             else:
                 title = h2_text
