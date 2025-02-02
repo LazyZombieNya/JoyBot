@@ -20,7 +20,7 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)# Увеличенный т�
 
 # URL сайта
 BASE_URL = "https://joy.reactor.cc/new"
-#BASE_URL = "https://joy.reactor.cc/post/6010465"
+#BASE_URL = "https://joy.reactor.cc/post/6015154"
 #BASE_URL = "https://joy.reactor.cc/post/6008824"
 PROCESSED_POSTS = set()  # Здесь будут храниться ID уже отправленных постов
 not_fully_processed_post = set()  # ID не до конца обработанных постов из-за ошибки
@@ -30,6 +30,7 @@ def parse_post(post):
     text_content = []
     media_content = []
     h2_text="" #теги поста
+    LIMIT_CAPTION=1024
     processed_images = set() #Список отправленных картинок
 
 
@@ -62,7 +63,10 @@ def parse_post(post):
         #img_url=img_url_full.replace("/full/", "/")
         img_name = img_url.split('/')[-1]
         if h2_text:
-            title=h2_text
+            if text_content and (sum(len(text) for text in text_content)+len(h2_text))<LIMIT_CAPTION:
+                title = h2_text + "".join(text_content)
+            else:
+                title=h2_text
         else:
             title = img_div.find("img").get("alt", "Нет тегов")
         if img_name not in processed_images:
@@ -74,13 +78,37 @@ def parse_post(post):
             media_content.append(("https:"+img_url, "photo", title))
             processed_images.add(img_name)
 
+    # Работаем с <div class="image">
+    for img_div in post.find_all('div', class_='image'):
+        if not img_div.find('span', class_='video_holder'): # если тег image не для видео
+            img_tag = img_div.find('img')
+            if img_tag and img_tag.get('src'):
+                img_url = img_tag['src']
+                img_name = img_url.split('/')[-1]
+                if h2_text:
+                    if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
+                        title = h2_text + "".join(text_content)
+                        text_content.clear()
+                    else:
+                        title = h2_text
+                else:
+                    title = img_tag.get("title", "Нет описания")
+                if img_name not in processed_images:
+                    media_content.append(("https:"+img_url, "photo", title))
+                    print("IMG "+img_url)
+                    processed_images.add(img_name)
 
     # Работаем с <span class="video_holder">
     for video_span in post.find_all('span', class_='video_holder'):
         source_tag = video_span.find('source', type="video/mp4")
         video_url = source_tag.get('src')
+        check_video_url("https:" +video_url)
         if h2_text:
-            title = h2_text
+            if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
+                title = h2_text + "".join(text_content)
+                text_content.clear()
+            else:
+                title = h2_text
         else:
             title = video_span.find("img").get("alt", "Нет тегов")
         media_content.append(("https:" + video_url, "video", title))
@@ -89,7 +117,11 @@ def parse_post(post):
     for gif_a in post.find_all('a', class_='video_gif_source'):
         gif_url = gif_a.get('href')
         if h2_text:
-            title = h2_text
+            if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
+                title = h2_text + "".join(text_content)
+                text_content.clear()
+            else:
+                title = h2_text
         else:
             title = gif_a.get("title", "Нет тегов")
         media_content.append(("https:" + gif_url, "video", title))
@@ -165,7 +197,8 @@ async def send_media_group(chat_id, post_id, media_content):
             await bot.send_media_group(chat_id=chat_id, media=photo_group)
             print(f"Фото-группа отправлена: {len(photo_group)} элементов")
 
-    time.sleep(2)  # задержка в 2 секунды чтобы не срабатывал Flood control exceeded
+        await asyncio.sleep(10)  # задержка в 2 секунды чтобы не срабатывал Flood control exceeded
+
 
 
 # Основной цикл для проверки новых постов
@@ -195,6 +228,7 @@ async def monitor_website():
 
                         # Отправляем текст
                         if text_content:
+                            print(text_content)
                             await send_text_to_telegram(text_content)
 
                         #if link:
@@ -206,13 +240,30 @@ async def monitor_website():
 
         except Exception as e:
             print(f"Ошибка: {e}")
-            print(post_id)
+            print("Ошибка в посте:"+post_id)
             not_fully_processed_post.add(post_id)
 
 
         # Задержка перед следующей проверкой
         await asyncio.sleep(60)  # Проверяем каждые 60 секунд
 
+def check_video_url(url):
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=5)
+        if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', '')
+            if 'video/' in content_type:
+                print(f"URL корректен. Content-Type: {content_type}")
+                return True
+            else:
+                print(f"Некорректный Content-Type: {content_type}")
+                return False
+        else:
+            print(f"Ошибка доступа к URL: {response.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка проверки URL: {e}")
+        return False
 
 # Запуск программы
 if __name__ == "__main__":
