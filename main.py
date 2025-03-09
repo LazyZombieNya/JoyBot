@@ -6,6 +6,7 @@ import uuid
 from collections import deque, Counter
 from urllib.parse import urlparse
 
+import html
 import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
@@ -32,16 +33,16 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный �
 
 # URL сайта
 BASE_URL = "https://joy.reactor.cc/new"
+#BASE_URL = "https://joy.reactor.cc/post/6035478"
 
 # Списки
 MAX_POSTS = 20
-PROCESSED_POSTS = deque(
-    maxlen=MAX_POSTS)  # Очередь с автоудалением старых записей # Здесь будут храниться ID уже отправленных постов
-
+PROCESSED_POSTS = deque(maxlen=MAX_POSTS)  # Очередь с автоудалением старых записей # Здесь будут храниться ID уже отправленных постов
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
 LIMIT_TEXT_MSG = 4096  # Лимит символов для одного сообщения телеграмм
 MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
-DATA_FOLDER = "temp_data" #Папка где хранятся временно скачанные файлы
+DATA_FOLDER = "temp_data" # Папка где хранятся временно скачанные файлы
+UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
 
 
 # Функция для парсинга одного поста
@@ -49,11 +50,15 @@ def parse_post(post):
     post_data = {"content": []}
     text_content = []
 
-    # Работаем с текстом (H2)
+    # Работаем с текстом (H2), теги
     for H2 in post.find_all('h2'):
         text = H2.get_text(", ", strip=True)
         if text:
-            post_data["content"].append({"id": str(uuid.uuid4()), "type": "h2", "data": text + "\n", "send": "yes"})
+            if any(tag in text for tag in UNWANTED_TAGS): #Проверка поста на не желательные теги
+                post_data.clear()
+                return {}, []  # Завершаем функцию, пост не обрабатывается
+            else:
+                post_data["content"].append({"id": str(uuid.uuid4()), "type": "h2", "data": text + "\n", "send": "yes"})
 
     # Работаем с текстом (H3)
     for H3 in post.find_all('h3'):
@@ -73,7 +78,7 @@ def parse_post(post):
         for element in p.contents:
             if element.name == "a":  # Если это ссылка
                 href = element.get("href")
-                link_text = element.get_text(strip=True)
+                link_text = html.escape(element.get_text(strip=True))
 
                 # Ограничиваем длину текста внутри ссылки (например, 30 символов)
                 if len(link_text) > 30:
@@ -82,7 +87,7 @@ def parse_post(post):
                 full_link = f'<a href="{href}">{link_text}</a>'
                 parts.append(full_link)
             elif isinstance(element, str):  # Если это обычный текст
-                parts.append(element.strip())
+                parts.append(html.escape(element.strip()))
 
         # Объединяем текстовые части и добавляем в список
         if parts:
@@ -142,8 +147,8 @@ def parse_post(post):
 
 
 # Функция для отправки текста в Telegram
-async def send_text_to_telegram(text_content):
-    message = "".join(text_content)
+async def send_text_to_telegram(text_content, caption):
+    message = "".join(text_content)+"\n"+caption
     if message.strip():
         # Разделяем текст на части, если он превышает лимит
         parts = [message[i:i + LIMIT_TEXT_MSG] for i in range(0, len(message), LIMIT_TEXT_MSG)]
@@ -162,8 +167,7 @@ async def send_post(chat_id, post_id, contents, text_content):
     id_gif = []
 
     content_list = contents.get("content", [])  # Получаем список вложений
-    title = next((item["data"] for item in content_list if item["type"] == "h2"),
-                 "")  # теги, которые находятся в заголовке H2
+    title = next((item["data"] for item in content_list if item["type"] == "h2"),"")  # теги, которые находятся в заголовке H2
     link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '  # Эта будет ссылкой на пост
     type_counts = Counter(item['type'] for item in content_list)  # Считаем количество типов файлов в json
 
@@ -325,12 +329,10 @@ async def send_post(chat_id, post_id, contents, text_content):
                 gif_group.clear()
                 id_gif.clear()
 
-        print(not_processed)
         if text_content:
-            await send_text_to_telegram(text_content)  # Отправляем длинные тексты
+            await send_text_to_telegram(text_content,caption)  # Отправляем длинные тексты
             text_content.clear()
-        await asyncio.sleep(10)  # задержка в 2 секунды чтобы не срабатывал Flood control exceeded
-    print(content_list)
+        await asyncio.sleep(30)  # задержка в 30 секунды чтобы не срабатывал Flood control exceeded
     if not everything_sent:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
@@ -366,14 +368,12 @@ async def download_video(url, filename):
                 print(f"Ошибка загрузки: {response.status}")
     return None
 
-
 # Узнаем какого разрешения файл по ссылке
 def get_file_extension(url):
     parsed_url = urlparse(url)
     path = parsed_url.path  # Достаем путь из ссылки
     extension = path.split('.')[-1]  # Берем последнее слово после точки
     return extension.lower()  # Возвращаем в нижнем регистре
-
 
 async def fetch_html(url):
     """Асинхронный запрос к сайту."""
@@ -399,11 +399,10 @@ async def monitor_website():
                 post_id_full = post.get("id")  # Уникальный идентификатор поста
                 post_id = post_id_full.split('postContainer')[-1].strip('"')
                 if post_id not in PROCESSED_POSTS:
-                    print(post_id)
                     post_data, text_content = parse_post(post)
-
                     # Отправляем данные с поста
                     if post_data:
+                       # print(post_data)
                         await send_post(chat_id=TELEGRAM_CHAT_ID, post_id=post_id, contents=post_data, text_content=text_content)
 
                     PROCESSED_POSTS.append(post_id)  # помечаем что пост отправлен
