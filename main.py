@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 import uuid
 from collections import deque, Counter
 from urllib.parse import urlparse
+from PIL import Image
+from io import BytesIO
+
 
 import html
 import aiofiles
@@ -33,7 +36,7 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный �
 
 # URL сайта
 BASE_URL = "https://joy.reactor.cc/new"
-#BASE_URL = "https://joy.reactor.cc/post/6035478"
+#BASE_URL = "https://joy.reactor.cc/post/6045040"
 
 # Списки
 MAX_POSTS = 20
@@ -41,6 +44,8 @@ PROCESSED_POSTS = deque(maxlen=MAX_POSTS)  # Очередь с автоудал�
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
 LIMIT_TEXT_MSG = 4096  # Лимит символов для одного сообщения телеграмм
 MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
+MAX_WIDTH_IMG = 1280 # Максимальные параметры размера изображений у Телеграмм
+MAX_HEIGHT_IMG = 720
 DATA_FOLDER = "temp_data" # Папка где хранятся временно скачанные файлы
 UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
 
@@ -78,13 +83,13 @@ def parse_post(post):
         for element in p.contents:
             if element.name == "a":  # Если это ссылка
                 href = element.get("href")
-                link_text = html.escape(element.get_text(strip=True))
+                link_text = element.get_text(strip=True)
 
                 # Ограничиваем длину текста внутри ссылки (например, 30 символов)
                 if len(link_text) > 30:
                     link_text = link_text[:27] + "..."  # Обрезаем текст и добавляем "..."
 
-                full_link = f'<a href="{href}">{link_text}</a>'
+                full_link = f'<a href="{html.escape(href)}">{html.escape(link_text)}</a>'
                 parts.append(full_link)
             elif isinstance(element, str):  # Если это обычный текст
                 parts.append(html.escape(element.strip()))
@@ -150,12 +155,19 @@ def parse_post(post):
 async def send_text_to_telegram(text_content, caption):
     message = "".join(text_content)+"\n"+caption
     if message.strip():
+        # Telegram требует, чтобы все HTML-сущности были экранированы
+        #message = html.escape(message, quote=True)
+        # Убираем лишнее экранирование у тегов <a> (делаем обратную замену)
+        #message = message.replace("&lt;a ", "<a ").replace("&lt;/a&gt;", "</a>")
         # Разделяем текст на части, если он превышает лимит
         parts = [message[i:i + LIMIT_TEXT_MSG] for i in range(0, len(message), LIMIT_TEXT_MSG)]
 
         for part in parts:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part, parse_mode=ParseMode.HTML)
-
+            try:
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"Ошибка текста: {e}")
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=html.escape(part), parse_mode=ParseMode.HTML)
 
 # Функция для отправки медиа-группы в Telegram
 async def send_post(chat_id, post_id, contents, text_content):
@@ -204,11 +216,23 @@ async def send_post(chat_id, post_id, contents, text_content):
                                             parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
                         id_photo.append(content["id"])
                     case "err":
-                        photo_group.append(
-                            InputMediaPhoto(media=content["data"].replace("/full/", "/"),
-                                            caption=(caption if not photo_group else None),
-                                            # убираем /full/ картинка будет не высокого качества
-                                            parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
+                        #photo_group.append( # убираем /full/ картинка будет не высокого качества
+                        #    InputMediaPhoto(media=content["data"].replace("/full/", "/"),
+                        #                    caption=(caption if not photo_group else None),
+                        #
+                        #                    parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
+                        #Качаем файл если по ссылке не отправляется
+                        photo_url = content["data"]
+                        ext = get_file_extension(photo_url)
+                        local_filename = f"temp_image_{content['id']}.{ext}"
+                        downloaded_file = await download_media(photo_url, local_filename)
+                        if downloaded_file:
+                            photo_group.append(InputMediaPhoto(
+                                media=open(downloaded_file, 'rb'),
+                                caption=(caption if not photo_group else None),
+                                parse_mode="HTML"))
+                        else:
+                            content["send"] = "close"
                         id_photo.append(content["id"])
 
             elif content["type"] == "video":
@@ -222,7 +246,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                         video_url = content["data"]
                         ext = get_file_extension(video_url)
                         local_filename = f"temp_video_{content['id']}.{ext}"
-                        downloaded_file = await download_video(video_url, local_filename)
+                        downloaded_file = await download_media(video_url, local_filename)
                         if downloaded_file:
                             video_group.append(InputMediaVideo(
                                 media=open(downloaded_file, 'rb'),
@@ -244,7 +268,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                         video_url = content["data"]
                         ext = get_file_extension(video_url)
                         local_filename = f"temp_video_{content['id']}.{ext}"
-                        downloaded_file = await download_video(video_url, local_filename)
+                        downloaded_file = await download_media(video_url, local_filename)
                         if downloaded_file:
                             gif_group.append(InputMediaAnimation(
                                 media=open(downloaded_file, 'rb'),
@@ -349,20 +373,33 @@ async def clear_data_folder():
             except Exception as e:
                 print(f"Ошибка при удалении {file_path}: {e}")
 
-# Скачивает видео на диск
-async def download_video(url, filename):
+# Скачивает медиафайлы на диск
+async def download_media(url, filename):
     headers = { # Делаем шапку чтобы не ругался и не блокировали доступ к файлам
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://joy.reactor.cc/"
     }
 
+    ext = filename.split('.')[-1].lower()# Определяем расширение файла
     os.makedirs(DATA_FOLDER, exist_ok=True) # Создаем папку Data, если её нет
     file_path = os.path.join(DATA_FOLDER, filename)
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
-                async with aiofiles.open(file_path, 'wb') as file:
-                    await file.write(await response.read())
+                file_bytes = await response.read()# Скачиваем файл как байты
+                # Если файл - изображение, меняем размер
+                if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
+                    # Открываем изображение с помощью PIL
+                    with Image.open(BytesIO(file_bytes)) as img:
+                        # Масштабируем изображение, сохраняя пропорции
+                        img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
+                        # Сохраняем изображение после изменения размера
+                        img.save(file_path)
+                else:
+                    # Для других файлов (например, видео) сохраняем без изменений
+                    async with aiofiles.open(file_path, 'wb') as file:
+                        #    await file.write(await response.read())
+                        await file.write(file_bytes)
                 return file_path
             else:
                 print(f"Ошибка загрузки: {response.status}")
