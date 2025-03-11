@@ -36,7 +36,6 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный �
 
 # URL сайта
 BASE_URL = "https://joy.reactor.cc/new"
-#BASE_URL = "https://joy.reactor.cc/post/6045040"
 
 # Списки
 MAX_POSTS = 20
@@ -63,14 +62,14 @@ def parse_post(post):
                 post_data.clear()
                 return {}, []  # Завершаем функцию, пост не обрабатывается
             else:
-                post_data["content"].append({"id": str(uuid.uuid4()), "type": "h2", "data": text + "\n", "send": "yes"})
+                post_data["content"].append({"id": str(uuid.uuid4()), "type": "h2", "data": html.escape(text) + "\n", "send": "yes"})
 
     # Работаем с текстом (H3)
     for H3 in post.find_all('h3'):
         text = H3.get_text(strip=True)
         if text:
             # post_data["content"].append({"type": "text", "data": text + "\n","send": "not"})
-            text_content.append(text + " \n")
+            text_content.append(html.escape(text) + " \n")
 
     # Работаем с текстом (p) и ссылками внутри него a href
     for p in post.find_all('p'):
@@ -94,9 +93,11 @@ def parse_post(post):
             elif isinstance(element, str):  # Если это обычный текст
                 parts.append(html.escape(element.strip()))
 
+
         # Объединяем текстовые части и добавляем в список
         if parts:
             text_content.append(", ".join(parts) + " \n")
+
 
     # Работаем с <div class="image">
     for img_div in post.find_all('div', class_='image'):
@@ -155,10 +156,6 @@ def parse_post(post):
 async def send_text_to_telegram(text_content, caption):
     message = "".join(text_content)+"\n"+caption
     if message.strip():
-        # Telegram требует, чтобы все HTML-сущности были экранированы
-        #message = html.escape(message, quote=True)
-        # Убираем лишнее экранирование у тегов <a> (делаем обратную замену)
-        #message = message.replace("&lt;a ", "<a ").replace("&lt;/a&gt;", "</a>")
         # Разделяем текст на части, если он превышает лимит
         parts = [message[i:i + LIMIT_TEXT_MSG] for i in range(0, len(message), LIMIT_TEXT_MSG)]
 
@@ -194,9 +191,13 @@ async def send_post(chat_id, post_id, contents, text_content):
     else:
         caption = link_post + title
 
+    count_send_photo = 0
+    count_send_video = 0
+    count_send_gif = 0
     not_processed = True  # Флаг отслеживания все ли обработано в посте
     everything_sent = True  # Флаг для отслеживания все ли отправлено
     while not_processed:
+
         not_processed = False
         for index, content in enumerate(content_list):
             if content["send"] == "yes":
@@ -258,6 +259,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                         id_video.append(content["id"])
 
             elif content["type"] == "gif":
+
                 match content["send"]:
                     case "not":
                         gif_group.append(InputMediaAnimation(media=content["data"],
@@ -278,7 +280,6 @@ async def send_post(chat_id, post_id, contents, text_content):
                         else:
                             content["send"] = "close"
                         id_gif.append(content["id"])
-
             elif content["type"] == "video_hosting":
                 if content["send"] == "not":
                     video_url = content["data"]
@@ -292,14 +293,14 @@ async def send_post(chat_id, post_id, contents, text_content):
                 content["send"] = "close"
 
             if photo_group and (
-                    (len(photo_group) == MAX_MEDIA_PER_GROUP) or (len(photo_group) == type_counts.get('photo', 0))):
-                # print(photo_group)
+                    (len(photo_group) == MAX_MEDIA_PER_GROUP) or (len(photo_group) >= (type_counts.get('photo', 0)-count_send_photo))):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=photo_group)
-                    await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
+                    await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
+                            count_send_photo += 1
                 except Exception as e:
                     print(f"Ошибка: {e}")
                     # not_processed = True
@@ -309,17 +310,19 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
+                                count_send_photo += 1
                 photo_group.clear()
                 id_photo.clear()
 
             if video_group and (
-                    (len(video_group) == MAX_MEDIA_PER_GROUP) or (len(video_group) == type_counts.get('video', 0))):
+                    (len(video_group) == MAX_MEDIA_PER_GROUP) or (len(video_group) == type_counts.get('video', 0)-count_send_video)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=video_group)
-                    await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
+                    await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
+                            count_send_video += 1
                 except Exception as e:
                     print(f"Ошибка: {e}")
                     # not_processed = True
@@ -329,18 +332,19 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
+                                count_send_video += 1
                 video_group.clear()
                 id_video.clear()
 
-            if gif_group and ((len(gif_group) == MAX_MEDIA_PER_GROUP) or (len(gif_group) == type_counts.get('gif', 0))):
+            if gif_group and ((len(gif_group) == MAX_MEDIA_PER_GROUP) or (len(gif_group) == type_counts.get('gif', 0)-count_send_gif)):
                 try:
                     for gif_file in gif_group:
-                        await bot.send_animation(chat_id=chat_id, animation=gif_file.media)
-                        await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
+                        await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,parse_mode="HTML")
+                        await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
-
+                            count_send_gif += 1
                 except Exception as e:
                     print(f"Ошибка: {e}")
                     # not_processed = True
@@ -350,6 +354,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
+                                count_send_gif += 1
                 gif_group.clear()
                 id_gif.clear()
 
