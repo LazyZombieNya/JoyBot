@@ -35,8 +35,7 @@ request = HTTPXRequest(connect_timeout=60, read_timeout=60)
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный таймаут
 
 # URL сайта
-#BASE_URL = "https://joy.reactor.cc/new"
-BASE_URL = "https://joy.reactor.cc/post/6047407"
+BASE_URL = "https://joy.reactor.cc/new"
 
 # Списки
 MAX_POSTS = 20
@@ -201,7 +200,6 @@ async def send_post(chat_id, post_id, contents, text_content):
     not_processed = True  # Флаг отслеживания все ли обработано в посте
     everything_sent = True  # Флаг для отслеживания все ли отправлено
     while not_processed:
-        print(content_list)
         not_processed = False
         for index, content in enumerate(content_list):
             if content["send"] == "yes":
@@ -402,7 +400,8 @@ async def download_media(url, filename):
                     with Image.open(BytesIO(file_bytes)) as img:
                         # Масштабируем изображение, сохраняя пропорции
                         img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
-
+                        #TODO надо исправить пропорциональное изменение размера файла при скачивании
+                        #//@photo Photo to send. The photo must be at most 10 MB in size. The photo's width and height must not exceed 10000 in total. Width and height ratio must be at most 20
                         # Получаем текущие размеры
                         #width, height = img.size
                         # Пропорционально масштабируем изображение, если оно превышает максимальные размеры
