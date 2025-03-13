@@ -92,12 +92,14 @@ def parse_post(post):
                 parts.append(full_link)
             elif isinstance(element, str):  # Если это обычный текст
                 parts.append(html.escape(element.strip()))
+            else:
+                # Если это тег с вложенным текстом (например, <b>, <i>, <u> и т.д.), извлекаем его текст
+                parts.append(html.escape(element.get_text(strip=True)))
 
 
         # Объединяем текстовые части и добавляем в список
         if parts:
             text_content.append(", ".join(parts) + " \n")
-
 
     # Работаем с <div class="image">
     for img_div in post.find_all('div', class_='image'):
@@ -165,6 +167,7 @@ async def send_text_to_telegram(text_content, caption):
             except Exception as e:
                 print(f"Ошибка текста: {e}")
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=html.escape(part), parse_mode=ParseMode.HTML)
+            await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
 
 # Функция для отправки медиа-группы в Telegram
 async def send_post(chat_id, post_id, contents, text_content):
@@ -197,7 +200,6 @@ async def send_post(chat_id, post_id, contents, text_content):
     not_processed = True  # Флаг отслеживания все ли обработано в посте
     everything_sent = True  # Флаг для отслеживания все ли отправлено
     while not_processed:
-
         not_processed = False
         for index, content in enumerate(content_list):
             if content["send"] == "yes":
@@ -296,7 +298,6 @@ async def send_post(chat_id, post_id, contents, text_content):
                     (len(photo_group) == MAX_MEDIA_PER_GROUP) or (len(photo_group) >= (type_counts.get('photo', 0)-count_send_photo))):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=photo_group)
-                    await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -311,6 +312,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             else:
                                 item["send"] = "close"
                                 count_send_photo += 1
+                await asyncio.sleep(40)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                 photo_group.clear()
                 id_photo.clear()
 
@@ -318,7 +320,6 @@ async def send_post(chat_id, post_id, contents, text_content):
                     (len(video_group) == MAX_MEDIA_PER_GROUP) or (len(video_group) == type_counts.get('video', 0)-count_send_video)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=video_group)
-                    await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -333,6 +334,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             else:
                                 item["send"] = "close"
                                 count_send_video += 1
+                await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                 video_group.clear()
                 id_video.clear()
 
@@ -340,7 +342,6 @@ async def send_post(chat_id, post_id, contents, text_content):
                 try:
                     for gif_file in gif_group:
                         await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,parse_mode="HTML")
-                        await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -355,13 +356,14 @@ async def send_post(chat_id, post_id, contents, text_content):
                             else:
                                 item["send"] = "close"
                                 count_send_gif += 1
+                await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                 gif_group.clear()
                 id_gif.clear()
 
         if text_content:
             await send_text_to_telegram(text_content,caption)  # Отправляем длинные тексты
             text_content.clear()
-        await asyncio.sleep(30)  # задержка в 30 секунды чтобы не срабатывал Flood control exceeded
+        await asyncio.sleep(60)  # задержка в 60 секунды чтобы не срабатывал Flood control exceeded
     if not everything_sent:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
@@ -398,6 +400,12 @@ async def download_media(url, filename):
                     with Image.open(BytesIO(file_bytes)) as img:
                         # Масштабируем изображение, сохраняя пропорции
                         img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
+                        #TODO надо исправить пропорциональное изменение размера файла при скачивании
+                        #//@photo Photo to send. The photo must be at most 10 MB in size. The photo's width and height must not exceed 10000 in total. Width and height ratio must be at most 20
+                        # Получаем текущие размеры
+                        #width, height = img.size
+                        # Пропорционально масштабируем изображение, если оно превышает максимальные размеры
+                        #img = img.resize((min(MAX_WIDTH_IMG, width), min(MAX_HEIGHT_IMG, height)))
                         # Сохраняем изображение после изменения размера
                         img.save(file_path)
                 else:
