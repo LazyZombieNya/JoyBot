@@ -8,13 +8,12 @@ from urllib.parse import urlparse
 from PIL import Image
 from io import BytesIO
 
-
 import html
 import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
 from telegram.constants import ParseMode
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
+from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation, InputFile
 from telegram.request import HTTPXRequest
 
 load_dotenv()  # Загружаем переменные из .env
@@ -22,7 +21,6 @@ load_dotenv()  # Загружаем переменные из .env
 # токен Telegram-бота и ID чата
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Ошибка: Не установлены переменные окружения!")
@@ -34,23 +32,29 @@ request = HTTPXRequest(connect_timeout=60, read_timeout=60)
 # Инициализация бота
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный таймаут
 
-# URL сайта
-BASE_URL = "https://joy.reactor.cc/new"
+# URL сайтов
+URLS = ["https://joy.reactor.cc/new"]
 
-# Списки
-MAX_POSTS = 20
-PROCESSED_POSTS = deque(maxlen=MAX_POSTS)  # Очередь с автоудалением старых записей # Здесь будут храниться ID уже отправленных постов
+# Ограничения Telegram
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
 LIMIT_TEXT_MSG = 4096  # Лимит символов для одного сообщения телеграмм
 MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
-MAX_WIDTH_IMG = 1280 # Максимальные параметры размера изображений у Телеграмм
-MAX_HEIGHT_IMG = 720
-DATA_FOLDER = "temp_data" # Папка где хранятся временно скачанные файлы
+MAX_SIZE_MB = 10  # Максимальный размер фото в MB
+MAX_TOTAL_DIMENSIONS = 10000  # Максимальная сумма ширины и высоты
+MAX_ASPECT_RATIO = 20  # Максимальное соотношение сторон
+MAX_WIDTH_IMG = 5000  # Максимальные размеры изображений, которые не выходят за лимиты
+MAX_HEIGHT_IMG = 5000
+
+# Списки
+MAX_POSTS = 50
+PROCESSED_POSTS = deque(
+    maxlen=MAX_POSTS)  # Очередь с автоудалением старых записей # Здесь будут храниться ID уже отправленных постов
+DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
 UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
 
 
-# Функция для парсинга одного поста
-def parse_post(post):
+# Функция для парсинга одного поста из joy.reactor.cc
+def parse_joy_post(post):
     post_data = {"content": []}
     text_content = []
 
@@ -58,11 +62,12 @@ def parse_post(post):
     for H2 in post.find_all('h2'):
         text = H2.get_text(", ", strip=True)
         if text:
-            if any(tag in text for tag in UNWANTED_TAGS): #Проверка поста на не желательные теги
+            if any(tag in text for tag in UNWANTED_TAGS):  # Проверка поста на не желательные теги
                 post_data.clear()
                 return {}, []  # Завершаем функцию, пост не обрабатывается
             else:
-                post_data["content"].append({"id": str(uuid.uuid4()), "type": "h2", "data": html.escape(text) + "\n", "send": "yes"})
+                post_data["content"].append(
+                    {"id": str(uuid.uuid4()), "type": "h2", "data": html.escape(text) + "\n", "send": "yes"})
 
     # Работаем с текстом (H3)
     for H3 in post.find_all('h3'):
@@ -73,9 +78,6 @@ def parse_post(post):
 
     # Работаем с текстом (p) и ссылками внутри него a href
     for p in post.find_all('p'):
-        # text = p.get_text(", ", strip=True)
-        # if text:
-        #    text_content.append(text + " \n")
         parts = []
 
         # Проходим по всем элементам внутри <p>
@@ -95,7 +97,6 @@ def parse_post(post):
             else:
                 # Если это тег с вложенным текстом (например, <b>, <i>, <u> и т.д.), извлекаем его текст
                 parts.append(html.escape(element.get_text(strip=True)))
-
 
         # Объединяем текстовые части и добавляем в список
         if parts:
@@ -129,12 +130,6 @@ def parse_post(post):
         for full_div in img_div.find_all('a', class_='prettyPhotoLink'):
             img_tag = "prettyPhotoLink"
             img_url = full_div.get('href')
-
-            # img_url=img_url_full.replace("/full/", "/")
-            # img_name = img_url.split('/')[-1]
-            # if text_content and (sum(len(text) for text in text_content) + len(h2_text)) < LIMIT_CAPTION:
-            # title = h2_text + "\n" + "".join(text_content)
-
             post_data["content"].append(
                 {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + img_url, "send": "not"})
 
@@ -156,7 +151,7 @@ def parse_post(post):
 
 # Функция для отправки текста в Telegram
 async def send_text_to_telegram(text_content, caption):
-    message = "".join(text_content)+"\n"+caption
+    message = "".join(text_content) + "\n" + caption
     if message.strip():
         # Разделяем текст на части, если он превышает лимит
         parts = [message[i:i + LIMIT_TEXT_MSG] for i in range(0, len(message), LIMIT_TEXT_MSG)]
@@ -169,6 +164,7 @@ async def send_text_to_telegram(text_content, caption):
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=html.escape(part), parse_mode=ParseMode.HTML)
             await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
 
+
 # Функция для отправки медиа-группы в Telegram
 async def send_post(chat_id, post_id, contents, text_content):
     photo_group = []
@@ -179,7 +175,8 @@ async def send_post(chat_id, post_id, contents, text_content):
     id_gif = []
 
     content_list = contents.get("content", [])  # Получаем список вложений
-    title = next((item["data"] for item in content_list if item["type"] == "h2"),"")  # теги, которые находятся в заголовке H2
+    title = next((item["data"] for item in content_list if item["type"] == "h2"),
+                 "")  # теги, которые находятся в заголовке H2
     link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '  # Эта будет ссылкой на пост
     type_counts = Counter(item['type'] for item in content_list)  # Считаем количество типов файлов в json
 
@@ -187,7 +184,7 @@ async def send_post(chat_id, post_id, contents, text_content):
     # if len(media_content) > 20:  # Задайте разумный предел, например, 50 элементов
     #    print(f"Слишком много медиафайлов: {len(media_content)}. Отправка частями.")
     #    media_content = media_content[:30]  # Обрежьте до первых 50
-    #    # print(media_content)
+
     if text_content and (sum(len(text) for text in text_content) + len(title + "\n") + len(link_post)) < LIMIT_CAPTION:
         caption = link_post + title + "\n" + "".join(text_content)
         text_content.clear()
@@ -219,21 +216,24 @@ async def send_post(chat_id, post_id, contents, text_content):
                                             parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
                         id_photo.append(content["id"])
                     case "err":
-                        #photo_group.append( # убираем /full/ картинка будет не высокого качества
+
+                        # photo_group.append( # убираем /full/ картинка будет не высокого качества
                         #    InputMediaPhoto(media=content["data"].replace("/full/", "/"),
                         #                    caption=(caption if not photo_group else None),
                         #
                         #                    parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
-                        #Качаем файл если по ссылке не отправляется
+
+                        # Качаем файл если по ссылке не отправляется
                         photo_url = content["data"]
                         ext = get_file_extension(photo_url)
                         local_filename = f"temp_image_{content['id']}.{ext}"
                         downloaded_file = await download_media(photo_url, local_filename)
                         if downloaded_file:
-                            photo_group.append(InputMediaPhoto(
-                                media=open(downloaded_file, 'rb'),
-                                caption=(caption if not photo_group else None),
-                                parse_mode="HTML"))
+                            with open(downloaded_file, 'rb') as file:
+                                photo_group.append(InputMediaPhoto(
+                                    media=file.read(),
+                                    caption=(caption if not photo_group else None),
+                                    parse_mode="HTML"))
                         else:
                             content["send"] = "close"
                         id_photo.append(content["id"])
@@ -295,7 +295,9 @@ async def send_post(chat_id, post_id, contents, text_content):
                 content["send"] = "close"
 
             if photo_group and (
-                    (len(photo_group) == MAX_MEDIA_PER_GROUP) or (len(photo_group) >= (type_counts.get('photo', 0)-count_send_photo))):
+                    (len(photo_group) == MAX_MEDIA_PER_GROUP) or (
+                    len(photo_group) >= (type_counts.get('photo', 0) - count_send_photo)) or (
+                            index == len(content_list) - 1)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=photo_group)
                     for item in content_list:
@@ -303,7 +305,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             item["send"] = "yes"
                             count_send_photo += 1
                 except Exception as e:
-                    print(f"Ошибка: {e}")
+                    print(f"Ошибка у {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
@@ -317,7 +319,9 @@ async def send_post(chat_id, post_id, contents, text_content):
                 id_photo.clear()
 
             if video_group and (
-                    (len(video_group) == MAX_MEDIA_PER_GROUP) or (len(video_group) == type_counts.get('video', 0)-count_send_video)):
+                    (len(video_group) == MAX_MEDIA_PER_GROUP) or (
+                    len(video_group) == type_counts.get('video', 0) - count_send_video) or (
+                            index == len(content_list) - 1)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=video_group)
                     for item in content_list:
@@ -325,7 +329,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             item["send"] = "yes"
                             count_send_video += 1
                 except Exception as e:
-                    print(f"Ошибка: {e}")
+                    print(f"Ошибка у {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
@@ -338,16 +342,18 @@ async def send_post(chat_id, post_id, contents, text_content):
                 video_group.clear()
                 id_video.clear()
 
-            if gif_group and ((len(gif_group) == MAX_MEDIA_PER_GROUP) or (len(gif_group) == type_counts.get('gif', 0)-count_send_gif)):
+            if gif_group and ((len(gif_group) == MAX_MEDIA_PER_GROUP) or (
+                    len(gif_group) == type_counts.get('gif', 0) - count_send_gif) or (index == len(content_list) - 1)):
                 try:
                     for gif_file in gif_group:
-                        await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,parse_mode="HTML")
+                        await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,
+                                                 parse_mode="HTML")
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
                             count_send_gif += 1
                 except Exception as e:
-                    print(f"Ошибка: {e}")
+                    print(f"Ошибка у {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
@@ -361,16 +367,17 @@ async def send_post(chat_id, post_id, contents, text_content):
                 id_gif.clear()
 
         if text_content:
-            await send_text_to_telegram(text_content,caption)  # Отправляем длинные тексты
+            await send_text_to_telegram(text_content, caption)  # Отправляем длинные тексты
             text_content.clear()
-        await asyncio.sleep(60)  # задержка в 60 секунды чтобы не срабатывал Flood control exceeded
+        await asyncio.sleep(10)  # задержка в 10 секунды чтобы не срабатывал Flood control exceeded
     if not everything_sent:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
                                parse_mode=ParseMode.HTML)
-    await clear_data_folder() #Удаляем скачанные файлы
+    await clear_data_folder()  # Удаляем скачанные файлы
 
-#Удаляет все файлы в папке DATA_FOLDER, если они есть.
+
+# Удаляет все файлы в папке DATA_FOLDER, если они есть.
 async def clear_data_folder():
     if os.path.exists(DATA_FOLDER):
         for file in os.listdir(DATA_FOLDER):
@@ -380,33 +387,50 @@ async def clear_data_folder():
             except Exception as e:
                 print(f"Ошибка при удалении {file_path}: {e}")
 
+
 # Скачивает медиафайлы на диск
 async def download_media(url, filename):
-    headers = { # Делаем шапку чтобы не ругался и не блокировали доступ к файлам
+    headers = {  # Делаем шапку чтобы не ругался и не блокировали доступ к файлам
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://joy.reactor.cc/"
     }
 
-    ext = filename.split('.')[-1].lower()# Определяем расширение файла
-    os.makedirs(DATA_FOLDER, exist_ok=True) # Создаем папку Data, если её нет
+    ext = filename.split('.')[-1].lower()  # Определяем расширение файла
+    os.makedirs(DATA_FOLDER, exist_ok=True)  # Создаем папку Data, если её нет
     file_path = os.path.join(DATA_FOLDER, filename)
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
-                file_bytes = await response.read()# Скачиваем файл как байты
+                file_bytes = await response.read()  # Скачиваем файл как байты
                 # Если файл - изображение, меняем размер
                 if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
                     # Открываем изображение с помощью PIL
                     with Image.open(BytesIO(file_bytes)) as img:
                         # Масштабируем изображение, сохраняя пропорции
-                        img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
-                        #TODO надо исправить пропорциональное изменение размера файла при скачивании
-                        #//@photo Photo to send. The photo must be at most 10 MB in size. The photo's width and height must not exceed 10000 in total. Width and height ratio must be at most 20
-                        # Получаем текущие размеры
-                        #width, height = img.size
-                        # Пропорционально масштабируем изображение, если оно превышает максимальные размеры
-                        #img = img.resize((min(MAX_WIDTH_IMG, width), min(MAX_HEIGHT_IMG, height)))
-                        # Сохраняем изображение после изменения размера
+                        # img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
+                        width, height = img.size
+
+                        # Проверяем по ограничениям Telegram
+                        if (width + height) > MAX_TOTAL_DIMENSIONS or (
+                                max(width, height) / min(width, height)) > MAX_ASPECT_RATIO:
+                            # Вычисляем коэффициент масштабирования
+                            scale_factor = min(MAX_TOTAL_DIMENSIONS / (width + height),
+                                               MAX_ASPECT_RATIO / (max(width, height) / min(width, height)))
+                            new_width = int(width * scale_factor)
+                            new_height = int(height * scale_factor)
+
+                            # Масштабируем изображение методом Lanczos
+                            img = img.resize((new_width, new_height), Image.LANCZOS)
+
+                        # Проверяем ограничение по размеру (10MB)
+                        img_bytes = BytesIO()
+                        img.save(img_bytes, format=ext)
+                        while len(img_bytes.getvalue()) > (MAX_SIZE_MB * 1024 * 1024):
+                            img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+                            img_bytes = BytesIO()
+                            img.save(img_bytes, format=ext)
+
+                        # Сохраняем на диск
                         img.save(file_path)
                 else:
                     # Для других файлов (например, видео) сохраняем без изменений
@@ -418,12 +442,14 @@ async def download_media(url, filename):
                 print(f"Ошибка загрузки: {response.status}")
     return None
 
+
 # Узнаем какого разрешения файл по ссылке
 def get_file_extension(url):
     parsed_url = urlparse(url)
     path = parsed_url.path  # Достаем путь из ссылки
     extension = path.split('.')[-1]  # Берем последнее слово после точки
     return extension.lower()  # Возвращаем в нижнем регистре
+
 
 async def fetch_html(url):
     """Асинхронный запрос к сайту."""
@@ -442,26 +468,30 @@ async def monitor_website():
 
     while True:
         try:
-            html = await fetch_html(BASE_URL)
-            soup = BeautifulSoup(html, "html.parser")
-            posts = soup.find_all("div", class_="postContainer")
-            for post in posts:
-                post_id_full = post.get("id")  # Уникальный идентификатор поста
-                post_id = post_id_full.split('postContainer')[-1].strip('"')
-                if post_id not in PROCESSED_POSTS:
-                    post_data, text_content = parse_post(post)
-                    # Отправляем данные с поста
-                    if post_data:
-                       # print(post_data)
-                        await send_post(chat_id=TELEGRAM_CHAT_ID, post_id=post_id, contents=post_data, text_content=text_content)
+            for url in URLS:
+                html = await fetch_html(url)
+                soup = BeautifulSoup(html, "html.parser")
+                posts = soup.find_all("div", class_="postContainer")
 
-                    PROCESSED_POSTS.append(post_id)  # помечаем что пост отправлен
+                for post in posts:
+
+                    post_id_full = post.get("id")  # Уникальный идентификатор поста
+                    post_id = post_id_full.split('postContainer')[-1].strip('"')
+                    if post_id not in PROCESSED_POSTS:
+                        post_data, text_content = parse_joy_post(post)
+                        # Отправляем данные с поста
+                        if post_data:
+                            # print(post_data)
+                            await send_post(chat_id=TELEGRAM_CHAT_ID, post_id=post_id, contents=post_data,
+                                            text_content=text_content)
+
+                        PROCESSED_POSTS.append(post_id)  # помечаем что пост отправлен
         except Exception as e:
             print(f"Ошибка: {e}")
             print("Ошибка в посте:" + post_id)
 
         # Задержка перед следующей проверкой
-        await asyncio.sleep(60)  # Проверяем каждые 60 секунд
+        await asyncio.sleep(30)  # Проверяем каждые 60 секунд
 
 
 # Запуск программы
