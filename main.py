@@ -296,7 +296,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
                     content["send"] = "yes"
             else:
-                await bot.send_message(chat_id=chat_id, text=f"Не известный контент {link_post} {content["data"]}")
+                await bot.send_message(chat_id=chat_id, text=f"Не известный контент {link_post} {content['data']}")
                 content["send"] = "close"
 
             if photo_group and (
