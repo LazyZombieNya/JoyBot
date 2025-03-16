@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 
 import uuid
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 from urllib.parse import urlparse
 from PIL import Image
 from io import BytesIO
@@ -20,9 +20,16 @@ load_dotenv()  # Загружаем переменные из .env
 
 # токен Telegram-бота и ID чата
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_V = os.getenv("TELEGRAM_CHAT_V")
+TELEGRAM_CHAT_PL = os.getenv("TELEGRAM_CHAT_PL")
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+# URL сайтов
+URLS_V = os.getenv("URLS_V", "").split(",")
+URLS_PL = os.getenv("URLS_PL", "").split(",")
+URLS = URLS_V + URLS_PL
+
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
     raise ValueError("Ошибка: Не установлены переменные окружения!")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -32,8 +39,7 @@ request = HTTPXRequest(connect_timeout=60, read_timeout=60)
 # Инициализация бота
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный таймаут
 
-# URL сайтов
-URLS = ["https://joy.reactor.cc/new"]
+
 
 # Ограничения Telegram
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
@@ -46,9 +52,8 @@ MAX_WIDTH_IMG = 5000  # Максимальные размеры изображе
 MAX_HEIGHT_IMG = 5000
 
 # Списки
-MAX_POSTS = 50
-PROCESSED_POSTS = deque(
-    maxlen=MAX_POSTS)  # Очередь с автоудалением старых записей # Здесь будут храниться ID уже отправленных постов
+MAX_POSTS = 30
+PROCESSED_POSTS = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
 DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
 UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
 
@@ -150,7 +155,7 @@ def parse_joy_post(post):
 
 
 # Функция для отправки текста в Telegram
-async def send_text_to_telegram(text_content, caption):
+async def send_text_to_telegram(chat_id, text_content, caption):
     message = "".join(text_content) + "\n" + caption
     if message.strip():
         # Разделяем текст на части, если он превышает лимит
@@ -158,10 +163,10 @@ async def send_text_to_telegram(text_content, caption):
 
         for part in parts:
             try:
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part, parse_mode=ParseMode.HTML)
+                await bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
             except Exception as e:
                 print(f"Ошибка текста: {e}")
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=html.escape(part), parse_mode=ParseMode.HTML)
+                await bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
             await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
 
 
@@ -288,8 +293,8 @@ async def send_post(chat_id, post_id, contents, text_content):
                     text = f'<a href="{video_url}">📺 Смотреть видео</a> \n\n {caption}'
 
                     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                    await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
                     content["send"] = "yes"
-
             else:
                 await bot.send_message(chat_id=chat_id, text=f"Не известный контент {link_post} {content["data"]}")
                 content["send"] = "close"
@@ -365,13 +370,11 @@ async def send_post(chat_id, post_id, contents, text_content):
                 await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
                 gif_group.clear()
                 id_gif.clear()
-
         if text_content:
-            await send_text_to_telegram(text_content, caption)  # Отправляем длинные тексты
+            await send_text_to_telegram(chat_id, text_content, caption)  # Отправляем длинные тексты
             text_content.clear()
-        await asyncio.sleep(10)  # задержка в 10 секунды чтобы не срабатывал Flood control exceeded
     if not everything_sent:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+        await bot.send_message(chat_id=chat_id,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
                                parse_mode=ParseMode.HTML)
     await clear_data_folder()  # Удаляем скачанные файлы
@@ -470,22 +473,24 @@ async def monitor_website():
         try:
             for url in URLS:
                 html = await fetch_html(url)
+                if url in URLS_V:
+                    chat_id = TELEGRAM_CHAT_V
+                elif url in URLS_PL:
+                    chat_id = TELEGRAM_CHAT_PL
                 soup = BeautifulSoup(html, "html.parser")
                 posts = soup.find_all("div", class_="postContainer")
-
                 for post in posts:
-
                     post_id_full = post.get("id")  # Уникальный идентификатор поста
                     post_id = post_id_full.split('postContainer')[-1].strip('"')
-                    if post_id not in PROCESSED_POSTS:
+                    if post_id not in PROCESSED_POSTS[url]:
                         post_data, text_content = parse_joy_post(post)
                         # Отправляем данные с поста
                         if post_data:
-                            # print(post_data)
-                            await send_post(chat_id=TELEGRAM_CHAT_ID, post_id=post_id, contents=post_data,
+
+                            await send_post(chat_id=chat_id, post_id=post_id, contents=post_data,
                                             text_content=text_content)
 
-                        PROCESSED_POSTS.append(post_id)  # помечаем что пост отправлен
+                        PROCESSED_POSTS[url].append(post_id)  # помечаем что пост отправлен
         except Exception as e:
             print(f"Ошибка: {e}")
             print("Ошибка в посте:" + post_id)
