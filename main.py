@@ -1,5 +1,9 @@
 import asyncio
 import os
+import pickle
+import platform
+
+import ffmpeg
 from dotenv import load_dotenv
 
 import uuid
@@ -30,7 +34,7 @@ URLS = URLS_V + URLS_PL
 
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
-    raise ValueError("Ошибка: Не установлены переменные окружения!")
+    raise ValueError("Error: (.env) Environment variables not set!")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -39,23 +43,57 @@ request = HTTPXRequest(connect_timeout=60, read_timeout=60)
 # Инициализация бота
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный таймаут
 
-
-
 # Ограничения Telegram
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
 LIMIT_TEXT_MSG = 4096  # Лимит символов для одного сообщения телеграмм
 MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
-MAX_SIZE_MB = 10  # Максимальный размер фото в MB
-MAX_TOTAL_DIMENSIONS = 10000  # Максимальная сумма ширины и высоты
-MAX_ASPECT_RATIO = 20  # Максимальное соотношение сторон
-MAX_WIDTH_IMG = 5000  # Максимальные размеры изображений, которые не выходят за лимиты
-MAX_HEIGHT_IMG = 5000
+MAX_SIZE_IMG_MB = 10  # Максимальный размер фото в MB
+MAX_SIZE_VIDEO_MB = 50  # Максимальный размер видео в MB
 
 # Списки
+SAVE_FILE = "sent_posts.pkl"# Файл данными об отправленных постах
 MAX_POSTS = 30
-PROCESSED_POSTS = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
+processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
 DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
 UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка, где лежит main.py
+if platform.system() == "Windows": # FFmpeg мультимедийный фреймворк для работы с медиафайлами
+    FFMPEG_PATH = os.path.join(BASE_DIR, "lib", "ffmpeg.exe") #https://ffmpeg.org/download.html
+    if not os.path.exists(FFMPEG_PATH):
+        raise FileNotFoundError(f"FFmpeg not found at path {FFMPEG_PATH}, download it: https://ffmpeg.org/download.html")
+else:
+    FFMPEG_PATH = "ffmpeg"  # В Linux ffmpeg доступен в PATH, если отсутствует (apt install ffmpeg)
+
+#Загрузка отправленных постов sent_posts из файла SAVE_FILE
+async def load_sent_posts():
+    global processed_posts
+    try:
+        async with aiofiles.open(SAVE_FILE, "rb") as file:
+            content = await file.read()  # Асинхронно читаем файл
+            if content:
+                loaded_data = pickle.loads(content)  # Десериализуем
+                # Преобразуем обратно в defaultdict с deque
+                processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS),
+                                         {key: deque(value, maxlen=MAX_POSTS) for key, value in loaded_data.items()})
+                print("Sent posts data successfully loaded!")
+    except FileNotFoundError:
+        print("File with saved posts not found, create a new one.")
+    except Exception as e:
+        print(f"Error loading: {e}")
+
+#Сохранение отправленных постов sent_posts в файл SAVE_FILE
+async def save_sent_posts():
+    print("Saving data before exiting...")
+    #print(f"Сохраняем данные: {sent_posts}")
+
+    # Преобразуем defaultdict в обычный dict, иначе pickle не сможет его сохранить
+    normal_dict = {key: list(value) for key, value in processed_posts.items()}
+    try:
+        async with aiofiles.open(SAVE_FILE, "wb") as file:
+            await file.write(pickle.dumps(normal_dict))
+        print("Data saved successfully!")
+    except Exception as e:
+        print(f"Error while saving: {e}")
 
 
 # Функция для парсинга одного поста из joy.reactor.cc
@@ -165,7 +203,7 @@ async def send_text_to_telegram(chat_id, text_content, caption):
             try:
                 await bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
             except Exception as e:
-                print(f"Ошибка текста: {e}")
+                print(f"Text error: {e}")
                 await bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
             await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
 
@@ -229,10 +267,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                         #                    parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
 
                         # Качаем файл если по ссылке не отправляется
-                        photo_url = content["data"]
-                        ext = get_file_extension(photo_url)
-                        local_filename = f"temp_image_{content['id']}.{ext}"
-                        downloaded_file = await download_media(photo_url, local_filename)
+                        downloaded_file = await download_media(content["data"])
                         if downloaded_file:
                             with open(downloaded_file, 'rb') as file:
                                 photo_group.append(InputMediaPhoto(
@@ -251,10 +286,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                                                            parse_mode="HTML"))
                         id_video.append(content["id"])
                     case "err":  # Пробуем качать видео на диск
-                        video_url = content["data"]
-                        ext = get_file_extension(video_url)
-                        local_filename = f"temp_video_{content['id']}.{ext}"
-                        downloaded_file = await download_media(video_url, local_filename)
+                        downloaded_file = await download_media(content["data"])
                         if downloaded_file:
                             video_group.append(InputMediaVideo(
                                 media=open(downloaded_file, 'rb'),
@@ -274,10 +306,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                                                              parse_mode="HTML"))
                         id_gif.append(content["id"])
                     case "err":  # Пробуем качать видео на диск
-                        video_url = content["data"]
-                        ext = get_file_extension(video_url)
-                        local_filename = f"temp_video_{content['id']}.{ext}"
-                        downloaded_file = await download_media(video_url, local_filename)
+                        downloaded_file = await download_media(content["data"])
                         if downloaded_file:
                             gif_group.append(InputMediaAnimation(
                                 media=open(downloaded_file, 'rb'),
@@ -310,7 +339,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             item["send"] = "yes"
                             count_send_photo += 1
                 except Exception as e:
-                    print(f"Ошибка у {post_id}: {e}")
+                    print(f"Error in post {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
@@ -334,7 +363,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             item["send"] = "yes"
                             count_send_video += 1
                 except Exception as e:
-                    print(f"Ошибка у {post_id}: {e}")
+                    print(f"Error in post {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
@@ -358,7 +387,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             item["send"] = "yes"
                             count_send_gif += 1
                 except Exception as e:
-                    print(f"Ошибка у {post_id}: {e}")
+                    print(f"Error in post {post_id}: {e}")
                     # not_processed = True
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
@@ -388,61 +417,110 @@ async def clear_data_folder():
             try:
                 os.remove(file_path)
             except Exception as e:
-                print(f"Ошибка при удалении {file_path}: {e}")
+                print(f"Error deleting {file_path}: {e}")
 
+#Сжатие картинок если они больше MAX_SIZE_IMG_MB
+async def compress_image(image_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 1024):
+    img = Image.open(BytesIO(image_bytes))
+    img = img.convert("RGB")  # Убираем прозрачность
+    output = BytesIO()
 
-# Скачивает медиафайлы на диск
-async def download_media(url, filename):
+    quality = 85  # Начальное качество JPEG
+    while True:
+        output.seek(0)
+        img.save(output, format="JPEG", quality=quality)
+        if output.tell() <= max_size or quality <= 10:
+            break
+        quality -= 5  # Уменьшаем качество
+
+    return output.getvalue()
+
+#Сжатие видео с помощью FFMPEG
+async def compress_video(input_path, output_path):
+    print(f"Compress video: {input_path} -> {output_path}")
+
+    command = [
+        FFMPEG_PATH, "-y", "-i", input_path,
+        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
+        "-b:v", "1M", output_path
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode == 0:
+        print(f"Compress finish: {output_path}")
+    else:
+        print(f"Error compress! {stderr.decode()}")
+
+    return os.path.exists(output_path)
+
+#Функция конвертации Gif в Mp4
+async def gif_to_mp4(input_path, output_path):
+    ffmpeg.input(input_path).output(
+        output_path, vcodec="libx264", crf=28, preset="fast"
+    ).run(overwrite_output=True)
+    return output_path
+
+#Скачивает медиафайлы на диск со сжатием
+async def download_media(url):
     headers = {  # Делаем шапку чтобы не ругался и не блокировали доступ к файлам
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://joy.reactor.cc/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Referer": url,  # Динамически подставляем URL
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
     }
 
-    ext = filename.split('.')[-1].lower()  # Определяем расширение файла
+    ext = get_file_extension(url)
+    if ext == "jpg": ext = "JPEG"  # Pillow не поддерживает "JPG", только "JPEG"
+    filename = f"temp_{url.split('/')[-1].lower()}"
     os.makedirs(DATA_FOLDER, exist_ok=True)  # Создаем папку Data, если её нет
     file_path = os.path.join(DATA_FOLDER, filename)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                file_bytes = await response.read()  # Скачиваем файл как байты
-                # Если файл - изображение, меняем размер
-                if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
-                    # Открываем изображение с помощью PIL
-                    with Image.open(BytesIO(file_bytes)) as img:
-                        # Масштабируем изображение, сохраняя пропорции
-                        # img.thumbnail((MAX_WIDTH_IMG, MAX_HEIGHT_IMG))
-                        width, height = img.size
 
-                        # Проверяем по ограничениям Telegram
-                        if (width + height) > MAX_TOTAL_DIMENSIONS or (
-                                max(width, height) / min(width, height)) > MAX_ASPECT_RATIO:
-                            # Вычисляем коэффициент масштабирования
-                            scale_factor = min(MAX_TOTAL_DIMENSIONS / (width + height),
-                                               MAX_ASPECT_RATIO / (max(width, height) / min(width, height)))
-                            new_width = int(width * scale_factor)
-                            new_height = int(height * scale_factor)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    file_bytes = await response.read()  # Скачиваем файл как байты
 
-                            # Масштабируем изображение методом Lanczos
-                            img = img.resize((new_width, new_height), Image.LANCZOS)
+                    if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
+                        compressed_bytes = await compress_image(file_bytes)
+                        with open(file_path, 'wb') as img_file:
+                            img_file.write(compressed_bytes)
 
-                        # Проверяем ограничение по размеру (10MB)
-                        img_bytes = BytesIO()
-                        img.save(img_bytes, format=ext)
-                        while len(img_bytes.getvalue()) > (MAX_SIZE_MB * 1024 * 1024):
-                            img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-                            img_bytes = BytesIO()
-                            img.save(img_bytes, format=ext)
+                    elif ext in ['mp4', 'avi', 'mov', 'mkv', 'webm', 'gif']:
+                        temp_path = file_path + "_temp" #Файл сперва скачиваем как _temp
+                        async with aiofiles.open(temp_path, 'wb') as file:
+                            await file.write(file_bytes)
+                        if ext == "gif":  # Всегда конвертируем GIF → MP4
+                            compressed_path = file_path.replace(".gif", ".mp4")
+                            await gif_to_mp4(temp_path, compressed_path)
+                        elif os.path.getsize(temp_path) < MAX_SIZE_VIDEO_MB * 1024 * 1024:  # Сжатие видео до MAX_SIZE_VIDEO_MB
+                            #print(f"Видео {temp_path} меньше {MAX_SIZE_VIDEO_MB} МБ, сжатие не требуется.")
+                            compressed_path = temp_path  # Используем как есть
+                        else:
+                            compressed_path = file_path
+                            await compress_video(temp_path, compressed_path)
 
-                        # Сохраняем на диск
-                        img.save(file_path)
+                        os.rename(compressed_path, file_path) # А потом как все операции с медиафайлом сделаны мы его переименуем, удаляем _temp
+                    else:
+                        print("Error: Unsupported file format")
+                        return None
+
+                    return file_path
                 else:
-                    # Для других файлов (например, видео) сохраняем без изменений
-                    async with aiofiles.open(file_path, 'wb') as file:
-                        #    await file.write(await response.read())
-                        await file.write(file_bytes)
-                return file_path
-            else:
-                print(f"Ошибка загрузки: {response.status}")
+                    print(f"Loading error: {response.status}")
+    except Exception as e:
+        print(f"Loading error: {file_path}: {e}")
+        return None
     return None
 
 
@@ -461,7 +539,7 @@ async def fetch_html(url):
             if response.status == 200:
                 return await response.text()
             else:
-                print(f"Ошибка загрузки сайта: {response.status}")
+                print(f"Site loading error: {response.status}")
                 return []
 
 
@@ -482,7 +560,7 @@ async def monitor_website():
                 for post in posts:
                     post_id_full = post.get("id")  # Уникальный идентификатор поста
                     post_id = post_id_full.split('postContainer')[-1].strip('"')
-                    if post_id not in PROCESSED_POSTS[url]:
+                    if post_id not in processed_posts[url]:
                         post_data, text_content = parse_joy_post(post)
                         # Отправляем данные с поста
                         if post_data:
@@ -490,15 +568,26 @@ async def monitor_website():
                             await send_post(chat_id=chat_id, post_id=post_id, contents=post_data,
                                             text_content=text_content)
 
-                        PROCESSED_POSTS[url].append(post_id)  # помечаем что пост отправлен
+                        processed_posts[url].append(post_id)  # помечаем что пост отправлен
         except Exception as e:
-            print(f"Ошибка: {e}")
-            print("Ошибка в посте:" + post_id)
+            print(f"Error in post {post_id}: {e}")
 
         # Задержка перед следующей проверкой
         await asyncio.sleep(30)  # Проверяем каждые 60 секунд
 
+async def main():
+    await load_sent_posts()  # Загружаем перед стартом
+    try:
+        while True:
+            await monitor_website()
+            await asyncio.sleep(60)  # Ждём 60 секунд перед следующим запросом
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("The bot is shutting down...")
+    finally:
+        await save_sent_posts()  # Сохранение перед выходом
+        await clear_data_folder() # Удаляем скачанные файлы
 
 # Запуск программы
 if __name__ == "__main__":
-    asyncio.run(monitor_website())
+    asyncio.run(main())  # Запуск главной асинхронной функции
+
