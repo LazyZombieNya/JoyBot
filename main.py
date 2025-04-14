@@ -2,6 +2,7 @@ import asyncio
 import os
 import pickle
 import platform
+import shutil
 
 import ffmpeg
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
 from telegram.constants import ParseMode
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation, InputFile
+from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.request import HTTPXRequest
 
 load_dotenv()  # Загружаем переменные из .env
@@ -32,6 +33,7 @@ URLS_V = os.getenv("URLS_V", "").split(",")
 URLS_PL = os.getenv("URLS_PL", "").split(",")
 URLS = URLS_V + URLS_PL
 
+UNWANTED_TAGS =os.getenv("UNWANTED_TAGS", "").split(",")  # Нежелательные теги, посты с этим тегом будут пропущены
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
     raise ValueError("Error: (.env) Environment variables not set!")
@@ -55,14 +57,20 @@ SAVE_FILE = "sent_posts.pkl"# Файл данными об отправленн�
 MAX_POSTS = 30
 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
 DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
-UNWANTED_TAGS = {"Ватные вбросы", "Я Ватник"}  # Нежелательные теги, посты с этим тегом будут пропущены
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка, где лежит main.py
-if platform.system() == "Windows": # FFmpeg мультимедийный фреймворк для работы с медиафайлами
+
+# FFmpeg мультимедийный фреймворк для работы с медиафайлами
+if platform.system() == "Windows":
     FFMPEG_PATH = os.path.join(BASE_DIR, "lib", "ffmpeg.exe") #https://ffmpeg.org/download.html
     if not os.path.exists(FFMPEG_PATH):
         raise FileNotFoundError(f"FFmpeg not found at path {FFMPEG_PATH}, download it: https://ffmpeg.org/download.html")
 else:
-    FFMPEG_PATH = "ffmpeg"  # В Linux ffmpeg доступен в PATH, если отсутствует (apt install ffmpeg)
+    # В Linux проверка, доступен ли ffmpeg в системном PATH
+    if shutil.which("ffmpeg") is None: #Проверяет, есть ли исполняемый файл ffmpeg в переменной окружения PATH
+        raise FileNotFoundError(
+            "FFmpeg not found in PATH. Install it: sudo apt install ffmpeg -y"
+        )
+    FFMPEG_PATH = "ffmpeg"
 
 #Загрузка отправленных постов sent_posts из файла SAVE_FILE
 async def load_sent_posts():
@@ -325,7 +333,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
                     content["send"] = "yes"
             else:
-                await bot.send_message(chat_id=chat_id, text=f"Не известный контент {link_post} {content['data']}")
+                await bot.send_message(chat_id=chat_id, text=f'Не известный контент {link_post} {content["data"]}')
                 content["send"] = "close"
 
             if photo_group and (
@@ -481,7 +489,7 @@ async def download_media(url):
 
     ext = get_file_extension(url)
     if ext == "jpg": ext = "JPEG"  # Pillow не поддерживает "JPG", только "JPEG"
-    filename = f"temp_{url.split('/')[-1].lower()}"
+    filename = f"temp_{url.split('/')[-1].lower()[:50]}.{ext}"
     os.makedirs(DATA_FOLDER, exist_ok=True)  # Создаем папку Data, если её нет
     file_path = os.path.join(DATA_FOLDER, filename)
 
