@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 import uuid
 from collections import deque, Counter, defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from PIL import Image
 from io import BytesIO
 
@@ -194,8 +194,29 @@ def parse_joy_post(post):
     # Работаем с <iframe это coub, youtube, vimeo
     for iframe in post.find_all('iframe'):
         iframe_url = iframe.get('src')
-        post_data["content"].append(
-            {"id": str(uuid.uuid4()), "type": "video_hosting", "data": iframe_url, "send": "not"})
+        if iframe_url:
+            parsed = urlparse(iframe_url)
+            clean_path = parsed.path
+            netloc = parsed.netloc
+
+            # Удаляем параметры
+            clean_url = urlunparse((parsed.scheme, netloc, clean_path, '', '', ''))
+
+            # Преобразуем embed-ссылки
+            if 'youtube.com' in netloc and '/embed/' in clean_path:
+                video_id = clean_path.split('/embed/')[-1]
+                clean_url = f"https://www.youtube.com/watch?v={video_id}"
+
+            elif 'coub.com' in netloc and '/embed/' in clean_path:
+                video_id = clean_path.split('/embed/')[-1]
+                clean_url = f"https://coub.com/view/{video_id}"
+
+            elif 'player.vimeo.com' in netloc and '/video/' in clean_path:
+                video_id = clean_path.split('/video/')[-1]
+                clean_url = f"https://vimeo.com/{video_id}"
+
+            post_data["content"].append(
+                {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"})
 
     return post_data, text_content
 
