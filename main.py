@@ -5,7 +5,6 @@ import platform
 import shutil
 import logging
 
-import ffmpeg
 from dotenv import load_dotenv
 
 import uuid
@@ -47,7 +46,7 @@ handler = RotatingFileHandler("logs/joybot.log", maxBytes=10*1024*1024, backupCo
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[handler] # Добавить , logging.StreamHandler() чтобы логи выходили в консоль
+    handlers=[handler] # Добавить, logging.StreamHandler() чтобы логи выходили в консоль
 )
 logger = logging.getLogger("JoyBot")
 
@@ -490,23 +489,31 @@ async def compress_image(image_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 1024):
         return None
 
 #Сжатие видео с помощью FFMPEG
-async def compress_video(input_path, output_path):    
+async def compress_video(input_path, output_path, timeout=300): # максимум 5 минут
     print(f"Compress video: {input_path} -> {output_path}")
     
-    try:
-        command = [
-            FFMPEG_PATH, "-y", "-i", input_path,
-            "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
-            "-b:v", "1M", output_path
-        ]
 
+    command = [
+        FFMPEG_PATH, "-y", "-i", input_path,
+        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
+        "-b:v", "1M", output_path
+    ]
+
+
+    try:
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
 
-        stdout, stderr = await process.communicate()
+        try: #Чтобы не вис процесс FFmpeg
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            print("FFmpeg timeout! Killing process...")
+            process.kill()
+            await process.wait()
+            return None
 
         if process.returncode == 0:
             print(f"Compress finish: {output_path}")
@@ -519,11 +526,33 @@ async def compress_video(input_path, output_path):
         return None
 
 #Функция конвертации Gif в Mp4
-async def gif_to_mp4(input_path, output_path):
-    ffmpeg.input(input_path).output(
-        output_path, vcodec="libx264", crf=28, preset="fast"
-    ).run(overwrite_output=True)
-    return output_path
+async def gif_to_mp4(input_path, output_path, timeout=120):
+    command = [
+        FFMPEG_PATH, "-y", "-i", input_path,
+        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
+        output_path
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            print("FFmpeg GIF convert timeout! Killing process...")
+            process.kill()
+            await process.wait()
+            return None
+
+        return os.path.exists(output_path)
+
+    except Exception as e:
+        print(f"Error while converting gif: {e}")
+        return None
 
 #Скачивает медиафайлы на диск со сжатием
 async def download_media(url):
