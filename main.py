@@ -3,6 +3,7 @@ import os
 import pickle
 import platform
 import shutil
+import logging
 
 import ffmpeg
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ from bs4 import BeautifulSoup
 from telegram.constants import ParseMode
 from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.request import HTTPXRequest
+from logging.handlers import RotatingFileHandler
 
 load_dotenv()  # Загружаем переменные из .env
 
@@ -37,6 +39,17 @@ UNWANTED_TAGS =os.getenv("UNWANTED_TAGS", "").split(",")  # Нежелатель
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
     raise ValueError("Error: (.env) Environment variables not set!")
+    
+# Создаём папку logs, если её нет
+os.makedirs("logs", exist_ok=True)
+#Логирование с ограничением 5 шт по 10мб.
+handler = RotatingFileHandler("logs/joybot.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[handler] # Добавить , logging.StreamHandler() чтобы логи выходили в консоль
+)
+logger = logging.getLogger("JoyBot")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -279,14 +292,14 @@ async def send_post(chat_id, post_id, contents, text_content):
             else:
                 not_processed = True
 
-            if content["type"] == "photo":
+            if content["type"] == "photo": #Если контент картинка
                 match content["send"]:
                     case "not":
                         photo_group.append(
                             InputMediaPhoto(media=content["data"],
                                             caption=(caption if not photo_group else None),
                                             parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
-                        id_photo.append(content["id"])
+                        id_photo.append(content["id"])                        
                     case "err":
 
                         # photo_group.append( # убираем /full/ картинка будет не высокого качества
@@ -327,7 +340,6 @@ async def send_post(chat_id, post_id, contents, text_content):
                         id_video.append(content["id"])
 
             elif content["type"] == "gif":
-
                 match content["send"]:
                     case "not":
                         gif_group.append(InputMediaAnimation(media=content["data"],
@@ -363,6 +375,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             index == len(content_list) - 1)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=photo_group)
+                    logger.info(f"Post {post_id} - Send pict {len(photo_group)}: {photo_group}")
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -387,6 +400,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                             index == len(content_list) - 1)):
                 try:
                     await bot.send_media_group(chat_id=chat_id, media=video_group)
+                    logger.info("Post %s - Send video %s",post_id, video_group)
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -411,6 +425,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     for gif_file in gif_group:
                         await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,
                                                  parse_mode="HTML")
+                        logger.info("Post %s - Send gif %s",post_id, gif_group)
                     for item in content_list:
                         if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
                             item["send"] = "yes"
@@ -450,44 +465,58 @@ async def clear_data_folder():
 
 #Сжатие картинок если они больше MAX_SIZE_IMG_MB
 async def compress_image(image_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 1024):
-    img = Image.open(BytesIO(image_bytes))
-    img = img.convert("RGB")  # Убираем прозрачность
-    output = BytesIO()
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        img = img.convert("RGB")  # Убираем прозрачность
+        
+        # Проверяем размер изображения до обработки
+        width, height = img.size
+        if width * height > Image.MAX_IMAGE_PIXELS:
+            print(f"[Error] The picture is too big ({width}x{height}), skipping")
+            return None
+        
+        output = BytesIO()
+        quality = 85  # Начальное качество JPEG
+        while True:
+            output.seek(0)
+            img.save(output, format="JPEG", quality=quality)
+            if output.tell() <= max_size or quality <= 10:
+                break
+            quality -= 5  # Уменьшаем качество
 
-    quality = 85  # Начальное качество JPEG
-    while True:
-        output.seek(0)
-        img.save(output, format="JPEG", quality=quality)
-        if output.tell() <= max_size or quality <= 10:
-            break
-        quality -= 5  # Уменьшаем качество
-
-    return output.getvalue()
+        return output.getvalue()
+    except Exception as e:
+        print(f"Error while processing image: {e}")
+        return None
 
 #Сжатие видео с помощью FFMPEG
-async def compress_video(input_path, output_path):
+async def compress_video(input_path, output_path):    
     print(f"Compress video: {input_path} -> {output_path}")
+    
+    try:
+        command = [
+            FFMPEG_PATH, "-y", "-i", input_path,
+            "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
+            "-b:v", "1M", output_path
+        ]
 
-    command = [
-        FFMPEG_PATH, "-y", "-i", input_path,
-        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
-        "-b:v", "1M", output_path
-    ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+        stdout, stderr = await process.communicate()
 
-    stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            print(f"Compress finish: {output_path}")
+        else:
+            print(f"Error compress! {stderr.decode()}")
 
-    if process.returncode == 0:
-        print(f"Compress finish: {output_path}")
-    else:
-        print(f"Error compress! {stderr.decode()}")
-
-    return os.path.exists(output_path)
+        return os.path.exists(output_path)
+    except Exception as e:
+        print(f"Error while processing video: {e}")
+        return None
 
 #Функция конвертации Gif в Mp4
 async def gif_to_mp4(input_path, output_path):
@@ -522,6 +551,8 @@ async def download_media(url):
 
                     if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
                         compressed_bytes = await compress_image(file_bytes)
+                        if not compressed_bytes:
+                            return None  # пропускаем слишком большие или битые картинки
                         with open(file_path, 'wb') as img_file:
                             img_file.write(compressed_bytes)
 
@@ -563,13 +594,17 @@ def get_file_extension(url):
 
 async def fetch_html(url):
     """Асинхронный запрос к сайту."""
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                return await response.text()
-            else:
-                print(f"Site loading error: {response.status}")
-                return []
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.text()
+                else:
+                    print(f"Site loading error: {response.status}")
+                    return "" #[]
+    except Exception as e: #если нет доступа до сайта
+        print(f"Connection error to {url}: {e}")
+        return ""
 
 
 # Основной цикл для проверки новых постов
