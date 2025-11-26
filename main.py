@@ -1,26 +1,25 @@
 import asyncio
+import html
+import logging
 import os
 import pickle
 import platform
 import shutil
-import logging
-
-from dotenv import load_dotenv
-
 import uuid
 from collections import deque, Counter, defaultdict
-from urllib.parse import urlparse, urlunparse
-from PIL import Image
 from io import BytesIO
+from logging.handlers import RotatingFileHandler
+from urllib.parse import urlparse, urlunparse
 
-import html
 import aiofiles
 import aiohttp
+from PIL import Image
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.constants import ParseMode
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
+from telegram.ext import Application, ApplicationBuilder, ContextTypes, AIORateLimiter
 from telegram.request import HTTPXRequest
-from logging.handlers import RotatingFileHandler
 
 load_dotenv()  # Загружаем переменные из .env
 
@@ -50,12 +49,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("JoyBot")
 
+# Создаём событие завершения
+shutdown_event = asyncio.Event()
+
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Устанавливаем таймауты (убираем ошибку timeout)
 request = HTTPXRequest(connect_timeout=60, read_timeout=60)
-# Инициализация бота
-bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)  # Увеличенный таймаут
 
 # Ограничения Telegram
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
@@ -66,8 +66,9 @@ MAX_SIZE_VIDEO_MB = 50  # Максимальный размер видео в MB
 
 # Списки
 SAVE_FILE = "sent_posts.pkl"# Файл данными об отправленных постах
-MAX_POSTS = 30
 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
+
+MAX_POSTS = 30
 DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка, где лежит main.py
 
@@ -85,7 +86,7 @@ else:
     FFMPEG_PATH = "ffmpeg"
 
 #Загрузка отправленных постов sent_posts из файла SAVE_FILE
-async def load_sent_posts():
+async def load_sent_posts(app: Application):
     global processed_posts
     try:
         async with aiofiles.open(SAVE_FILE, "rb") as file:
@@ -95,26 +96,25 @@ async def load_sent_posts():
                 # Преобразуем обратно в defaultdict с deque
                 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS),
                                          {key: deque(value, maxlen=MAX_POSTS) for key, value in loaded_data.items()})
-                print("Sent posts data successfully loaded!")
+                logger.info("Sent posts data successfully loaded!")
     except FileNotFoundError:
-        print("File with saved posts not found, create a new one.")
+        logger.info("File with saved posts not found, create a new one.")
     except Exception as e:
-        print(f"Error loading: {e}")
+        logger.info(f"Error loading: {e}")
 
 #Сохранение отправленных постов sent_posts в файл SAVE_FILE
-async def save_sent_posts():
-    print("Saving data before exiting...")
+async def save_sent_posts(app: Application):
+    logger.info("Saving data before exiting...")
     #print(f"Сохраняем данные: {sent_posts}")
 
     # Преобразуем defaultdict в обычный dict, иначе pickle не сможет его сохранить
     normal_dict = {key: list(value) for key, value in processed_posts.items()}
     try:
         async with aiofiles.open(SAVE_FILE, "wb") as file:
-            await file.write(pickle.dumps(normal_dict))
-        print("Data saved successfully!")
-    except Exception as e:
-        print(f"Error while saving: {e}")
-
+            await file.write(pickle.dumps(normal_dict))        
+        logger.info("Data saved successfully!")
+    except Exception as e:        
+        logger.info(f"Error while saving: {e}")
 
 # Функция для парсинга одного поста из joy.reactor.cc
 def parse_joy_post(post):
@@ -234,7 +234,7 @@ def parse_joy_post(post):
 
 
 # Функция для отправки текста в Telegram
-async def send_text_to_telegram(chat_id, text_content, caption):
+async def send_text_to_telegram(context: ContextTypes.DEFAULT_TYPE, chat_id, text_content, caption):
     message = "".join(text_content) + "\n" + caption
     if message.strip():
         # Разделяем текст на части, если он превышает лимит
@@ -242,15 +242,15 @@ async def send_text_to_telegram(chat_id, text_content, caption):
 
         for part in parts:
             try:
-                await bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
+                await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
             except Exception as e:
                 print(f"Text error: {e}")
-                await bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
+                await context.bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
             await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
 
 
 # Функция для отправки медиа-группы в Telegram
-async def send_post(chat_id, post_id, contents, text_content):
+async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
     photo_group = []
     id_photo = []
     video_group = []
@@ -361,11 +361,10 @@ async def send_post(chat_id, post_id, contents, text_content):
                     video_url = content["data"]
                     text = f'<a href="{video_url}">📺 Смотреть видео</a> \n\n {caption}'
 
-                    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-                    await asyncio.sleep(10)  # задержка в 10 секунд чтобы не срабатывал Flood control exceeded
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
                     content["send"] = "yes"
             else:
-                await bot.send_message(chat_id=chat_id, text=f'Не известный контент {link_post} {content["data"]}')
+                await context.bot.send_message(chat_id=chat_id, text=f'Не известный контент {link_post} {content["data"]}')
                 content["send"] = "close"
 
             if photo_group and (
@@ -373,7 +372,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     len(photo_group) >= (type_counts.get('photo', 0) - count_send_photo)) or (
                             index == len(content_list) - 1)):
                 try:
-                    await bot.send_media_group(chat_id=chat_id, media=photo_group)
+                    await context.bot.send_media_group(chat_id=chat_id, media=photo_group)
                     logger.info(f"Post {post_id} - Send pict {len(photo_group)}: {photo_group}")
                     for item in content_list:
                         if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
@@ -388,8 +387,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
-                                count_send_photo += 1
-                await asyncio.sleep(40)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
+                                count_send_photo += 1                
                 photo_group.clear()
                 id_photo.clear()
 
@@ -398,7 +396,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     len(video_group) == type_counts.get('video', 0) - count_send_video) or (
                             index == len(content_list) - 1)):
                 try:
-                    await bot.send_media_group(chat_id=chat_id, media=video_group)
+                    await context.bot.send_media_group(chat_id=chat_id, media=video_group)
                     logger.info("Post %s - Send video %s",post_id, video_group)
                     for item in content_list:
                         if item["id"] in id_video:  # Проверяем, есть ли ID в списке
@@ -413,8 +411,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
-                                count_send_video += 1
-                await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
+                                count_send_video += 1                
                 video_group.clear()
                 id_video.clear()
 
@@ -422,7 +419,7 @@ async def send_post(chat_id, post_id, contents, text_content):
                     len(gif_group) == type_counts.get('gif', 0) - count_send_gif) or (index == len(content_list) - 1)):
                 try:
                     for gif_file in gif_group:
-                        await bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,
+                        await context.bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,
                                                  parse_mode="HTML")
                         logger.info("Post %s - Send gif %s",post_id, gif_group)
                     for item in content_list:
@@ -438,15 +435,14 @@ async def send_post(chat_id, post_id, contents, text_content):
                                 item["send"] = "err"
                             else:
                                 item["send"] = "close"
-                                count_send_gif += 1
-                await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
+                                count_send_gif += 1                
                 gif_group.clear()
                 id_gif.clear()
         if text_content:
-            await send_text_to_telegram(chat_id, text_content, caption)  # Отправляем длинные тексты
+            await send_text_to_telegram(context,chat_id, text_content, caption)  # Отправляем длинные тексты
             text_content.clear()
     if not everything_sent:
-        await bot.send_message(chat_id=chat_id,
+        await context.bot.send_message(chat_id=chat_id,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
                                parse_mode=ParseMode.HTML)
     await clear_data_folder()  # Удаляем скачанные файлы
@@ -629,58 +625,69 @@ async def fetch_html(url):
                 if response.status == 200:
                     return await response.text()
                 else:
-                    print(f"Site loading error: {response.status}")
+                    logger.error(f"Site loading error: {response.status}")
                     return "" #[]
     except Exception as e: #если нет доступа до сайта
-        print(f"Connection error to {url}: {e}")
+        logger.error(f"Connection error to {url}: {e}")
         return ""
 
 
 # Основной цикл для проверки новых постов
-async def monitor_website():
+async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
     post_id = 0
-
-    while True:
-        try:
-            for url in URLS:
-                html = await fetch_html(url)
-                if url in URLS_V:
-                    chat_id = TELEGRAM_CHAT_V
-                elif url in URLS_PL:
-                    chat_id = TELEGRAM_CHAT_PL
-                soup = BeautifulSoup(html, "html.parser")
-                posts = soup.find_all("div", class_="postContainer")
-                for post in posts:
-                    post_id_full = post.get("id")  # Уникальный идентификатор поста
-                    post_id = post_id_full.split('postContainer')[-1].strip('"')
-                    if post_id not in processed_posts[url]:
-                        post_data, text_content = parse_joy_post(post)
-                        # Отправляем данные с поста
-                        if post_data:
-
-                            await send_post(chat_id=chat_id, post_id=post_id, contents=post_data,
-                                            text_content=text_content)
-
-                        processed_posts[url].append(post_id)  # помечаем что пост отправлен
-        except Exception as e:
-            print(f"Error in post {post_id}: {e}")
-
-        # Задержка перед следующей проверкой
-        await asyncio.sleep(30)  # Проверяем каждые 60 секунд
-
-async def main():
-    await load_sent_posts()  # Загружаем перед стартом
     try:
-        while True:
-            await monitor_website()
-            await asyncio.sleep(60)  # Ждём 60 секунд перед следующим запросом
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        print("The bot is shutting down...")
-    finally:
-        await save_sent_posts()  # Сохранение перед выходом
-        await clear_data_folder() # Удаляем скачанные файлы
+        for url in URLS:
+            html_text = await fetch_html(url)
+            if not html_text: continue
+
+            chat_id = TELEGRAM_CHAT_V if url in URLS_V else TELEGRAM_CHAT_PL
+            soup = BeautifulSoup(html_text, "html.parser")
+            posts = soup.find_all("div", class_="postContainer")
+            for post in posts:
+                post_id_full = post.get("id")  # Уникальный идентификатор поста
+                post_id = post_id_full.split('postContainer')[-1].strip('"')
+                if post_id not in processed_posts[url]:
+                    post_data, text_content = parse_joy_post(post)
+                    # Отправляем данные с поста
+                    if post_data:
+                        await send_post(context,chat_id=chat_id, post_id=post_id, contents=post_data,
+                                        text_content=text_content)
+
+                    processed_posts[url].append(post_id)  # помечаем что пост отправлен
+                    # Небольшая пауза между постами, чтобы не спамить
+                    await asyncio.sleep(5)
+    except Exception as e:
+        print(f"Error in post {post_id}: {e}")
 
 # Запуск программы
 if __name__ == "__main__":
-    asyncio.run(main())  # Запуск главной асинхронной функции
+    #asyncio.run(main())  # Запуск главной асинхронной функции
+    # 1. Настраиваем RateLimiter (Решает проблему Flood Control)
+    rate_limiter = AIORateLimiter(
+        overall_max_rate=30,  # Не более 30 сообщений в секунду (общий лимит)
+        overall_time_period=1,
+        group_time_period=60,  # Групповые лимиты
+        max_retries=5  # Сколько раз повторять при ошибке сети
+    )
+
+    # 2. Создаем приложение
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .rate_limiter(rate_limiter)  # Подключаем лимитер
+        .post_init(load_sent_posts)  # Загрузка данных при старте
+        .post_shutdown(save_sent_posts)  # Сохранение данных при выходе (SIGTERM)
+        .build()
+    )
+
+    # 3. Добавляем задачу мониторинга в очередь
+    # run_repeating запускает monitor_website_job каждые 60 секунд
+    # first=1 означает первый запуск через 1 секунду после старта
+    application.job_queue.run_repeating(monitor_website, interval=60, first=1)
+
+    # 4. Запускаем бота (Polling)
+    # Это блокирующая операция, которая сама обрабатывает сигналы systemd
+    logger.info("Bot started via PTB Application")
+    application.run_polling()
 
