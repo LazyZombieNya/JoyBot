@@ -49,9 +49,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("JoyBot")
 
-# Создаём событие завершения
-shutdown_event = asyncio.Event()
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Устанавливаем таймауты (убираем ошибку timeout)
