@@ -3,23 +3,21 @@ import html
 import logging
 import os
 import pickle
-import platform
-import shutil
 import uuid
 from collections import deque, Counter, defaultdict
-from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, urlunparse
 
 import aiofiles
 import aiohttp
-from PIL import Image
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, ContextTypes, AIORateLimiter
 from telegram.request import HTTPXRequest
+
+from media_processor import download_media, clear_data_folder
 
 load_dotenv()  # Загружаем переменные из .env
 
@@ -47,6 +45,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[handler] # Добавить, logging.StreamHandler() чтобы логи выходили в консоль
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger("JoyBot")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -58,29 +58,12 @@ request = HTTPXRequest(connect_timeout=60, read_timeout=60)
 LIMIT_CAPTION = 1024  # Лимит символов описания поста телеграмм
 LIMIT_TEXT_MSG = 4096  # Лимит символов для одного сообщения телеграмм
 MAX_MEDIA_PER_GROUP = 10  # Лимит Telegram на медиа-группу
-MAX_SIZE_IMG_MB = 10  # Максимальный размер фото в MB
-MAX_SIZE_VIDEO_MB = 50  # Максимальный размер видео в MB
 
 # Списки
 SAVE_FILE = "sent_posts.pkl"# Файл данными об отправленных постах
 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
 
 MAX_POSTS = 30
-DATA_FOLDER = "temp_data"  # Папка где хранятся временно скачанные файлы
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка, где лежит main.py
-
-# FFmpeg мультимедийный фреймворк для работы с медиафайлами
-if platform.system() == "Windows":
-    FFMPEG_PATH = os.path.join(BASE_DIR, "lib", "ffmpeg.exe") #https://ffmpeg.org/download.html
-    if not os.path.exists(FFMPEG_PATH):
-        raise FileNotFoundError(f"FFmpeg not found at path {FFMPEG_PATH}, download it: https://ffmpeg.org/download.html")
-else:
-    # В Linux проверка, доступен ли ffmpeg в системном PATH
-    if shutil.which("ffmpeg") is None: #Проверяет, есть ли исполняемый файл ffmpeg в переменной окружения PATH
-        raise FileNotFoundError(
-            "FFmpeg not found in PATH. Install it: sudo apt install ffmpeg -y"
-        )
-    FFMPEG_PATH = "ffmpeg"
 
 #Загрузка отправленных постов sent_posts из файла SAVE_FILE
 async def load_sent_posts(app: Application):
@@ -288,30 +271,25 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
             else:
                 not_processed = True
 
-            if content["type"] == "photo": #Если контент картинка
+            if content["type"] == "photo":  # Если контент картинка
                 match content["send"]:
                     case "not":
                         photo_group.append(
                             InputMediaPhoto(media=content["data"],
                                             caption=(caption if not photo_group else None),
-                                            parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
-                        id_photo.append(content["id"])                        
+                                            parse_mode="HTML"))
+                        id_photo.append(content["id"])
                     case "err":
-
-                        # photo_group.append( # убираем /full/ картинка будет не высокого качества
-                        #    InputMediaPhoto(media=content["data"].replace("/full/", "/"),
-                        #                    caption=(caption if not photo_group else None),
-                        #
-                        #                    parse_mode="HTML"))  # caption только на первую картинку, так описание к группе будет
-
                         # Качаем файл если по ссылке не отправляется
-                        downloaded_file = await download_media(content["data"])
-                        if downloaded_file:
-                            with open(downloaded_file, 'rb') as file:
-                                photo_group.append(InputMediaPhoto(
-                                    media=file.read(),
-                                    caption=(caption if not photo_group else None),
-                                    parse_mode="HTML"))
+                        downloaded_files = await download_media(content["data"])
+                        if downloaded_files:
+                            # Проходим циклом, так как media_processor возвращает список
+                            for file_path in downloaded_files:
+                                with open(file_path, 'rb') as file:
+                                    photo_group.append(InputMediaPhoto(
+                                        media=file.read(),
+                                        caption=(caption if not photo_group else None),
+                                        parse_mode="HTML"))
                         else:
                             content["send"] = "close"
                         id_photo.append(content["id"])
@@ -324,13 +302,14 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                                                            parse_mode="HTML"))
                         id_video.append(content["id"])
                     case "err":  # Пробуем качать видео на диск
-                        downloaded_file = await download_media(content["data"])
-                        if downloaded_file:
-                            video_group.append(InputMediaVideo(
-                                media=open(downloaded_file, 'rb'),
-                                caption=(caption if not video_group else None),
-                                parse_mode="HTML"
-                            ))
+                        downloaded_files = await download_media(content["data"])
+                        if downloaded_files:
+                            for file_path in downloaded_files:
+                                video_group.append(InputMediaVideo(
+                                    media=open(file_path, 'rb'),
+                                    caption=(caption if not video_group else None),
+                                    parse_mode="HTML"
+                                ))
                         else:
                             content["send"] = "close"
                         id_video.append(content["id"])
@@ -341,6 +320,18 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                         gif_group.append(InputMediaAnimation(media=content["data"],
                                                              caption=(caption if not gif_group else None),
                                                              parse_mode="HTML"))
+                        id_gif.append(content["id"])
+                    case "err":  # Пробуем качать видео на диск
+                        downloaded_files = await download_media(content["data"])
+                        if downloaded_files:
+                            for file_path in downloaded_files:
+                                gif_group.append(InputMediaAnimation(
+                                    media=open(file_path, 'rb'),
+                                    caption=(caption if not gif_group else None),
+                                    parse_mode="HTML"
+                                ))
+                        else:
+                            content["send"] = "close"
                         id_gif.append(content["id"])
                     case "err":  # Пробуем качать видео на диск
                         downloaded_file = await download_media(content["data"])
@@ -442,177 +433,8 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
         await context.bot.send_message(chat_id=chat_id,
                                text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
                                parse_mode=ParseMode.HTML)
+
     await clear_data_folder()  # Удаляем скачанные файлы
-
-
-# Удаляет все файлы в папке DATA_FOLDER, если они есть.
-async def clear_data_folder():
-    if os.path.exists(DATA_FOLDER):
-        for file in os.listdir(DATA_FOLDER):
-            file_path = os.path.join(DATA_FOLDER, file)
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                print(f"Error deleting {file_path}: {e}")
-
-#Сжатие картинок если они больше MAX_SIZE_IMG_MB
-async def compress_image(image_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 1024):
-    try:
-        img = Image.open(BytesIO(image_bytes))
-        img = img.convert("RGB")  # Убираем прозрачность
-        
-        # Проверяем размер изображения до обработки
-        width, height = img.size
-        if width * height > Image.MAX_IMAGE_PIXELS:
-            print(f"[Error] The picture is too big ({width}x{height}), skipping")
-            return None
-        
-        output = BytesIO()
-        quality = 85  # Начальное качество JPEG
-        while True:
-            output.seek(0)
-            img.save(output, format="JPEG", quality=quality)
-            if output.tell() <= max_size or quality <= 10:
-                break
-            quality -= 5  # Уменьшаем качество
-
-        return output.getvalue()
-    except Exception as e:
-        print(f"Error while processing image: {e}")
-        return None
-
-#Сжатие видео с помощью FFMPEG
-async def compress_video(input_path, output_path, timeout=300): # максимум 5 минут
-    print(f"Compress video: {input_path} -> {output_path}")
-    
-
-    command = [
-        FFMPEG_PATH, "-y", "-i", input_path,
-        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
-        "-b:v", "1M", output_path
-    ]
-
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        try: #Чтобы не вис процесс FFmpeg
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            print("FFmpeg timeout! Killing process...")
-            process.kill()
-            await process.wait()
-            return None
-
-        if process.returncode == 0:
-            print(f"Compress finish: {output_path}")
-        else:
-            print(f"Error compress! {stderr.decode()}")
-
-        return os.path.exists(output_path)
-    except Exception as e:
-        print(f"Error while processing video: {e}")
-        return None
-
-#Функция конвертации Gif в Mp4
-async def gif_to_mp4(input_path, output_path, timeout=120):
-    command = [
-        FFMPEG_PATH, "-y", "-i", input_path,
-        "-vcodec", "libx264", "-crf", "28", "-preset", "fast",
-        output_path
-    ]
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        try:
-            await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            print("FFmpeg GIF convert timeout! Killing process...")
-            process.kill()
-            await process.wait()
-            return None
-
-        return os.path.exists(output_path)
-
-    except Exception as e:
-        print(f"Error while converting gif: {e}")
-        return None
-
-#Скачивает медиафайлы на диск со сжатием
-async def download_media(url):
-    headers = {  # Делаем шапку чтобы не ругался и не блокировали доступ к файлам
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        "Referer": url,  # Динамически подставляем URL
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-        "Connection": "keep-alive",
-    }
-
-    ext = get_file_extension(url)
-    if ext == "jpg": ext = "JPEG"  # Pillow не поддерживает "JPG", только "JPEG"
-    filename = f"temp_{url.split('/')[-1].lower()[:50]}.{ext}"
-    os.makedirs(DATA_FOLDER, exist_ok=True)  # Создаем папку Data, если её нет
-    file_path = os.path.join(DATA_FOLDER, filename)
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    file_bytes = await response.read()  # Скачиваем файл как байты
-
-                    if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
-                        compressed_bytes = await compress_image(file_bytes)
-                        if not compressed_bytes:
-                            return None  # пропускаем слишком большие или битые картинки
-                        with open(file_path, 'wb') as img_file:
-                            img_file.write(compressed_bytes)
-
-                    elif ext in ['mp4', 'avi', 'mov', 'mkv', 'webm', 'gif']:
-                        temp_path = file_path + "_temp" #Файл сперва скачиваем как _temp
-                        async with aiofiles.open(temp_path, 'wb') as file:
-                            await file.write(file_bytes)
-                        if ext == "gif":  # Всегда конвертируем GIF → MP4
-                            compressed_path = file_path.replace(".gif", ".mp4")
-                            await gif_to_mp4(temp_path, compressed_path)
-                        elif os.path.getsize(temp_path) < MAX_SIZE_VIDEO_MB * 1024 * 1024:  # Сжатие видео до MAX_SIZE_VIDEO_MB
-                            #print(f"Видео {temp_path} меньше {MAX_SIZE_VIDEO_MB} МБ, сжатие не требуется.")
-                            compressed_path = temp_path  # Используем как есть
-                        else:
-                            compressed_path = file_path
-                            await compress_video(temp_path, compressed_path)
-
-                        os.rename(compressed_path, file_path) # А потом как все операции с медиафайлом сделаны мы его переименуем, удаляем _temp
-                    else:
-                        print("Error: Unsupported file format")
-                        return None
-
-                    return file_path
-                else:
-                    print(f"Loading error: {response.status}")
-    except Exception as e:
-        print(f"Loading error: {file_path}: {e}")
-        return None
-    return None
-
-
-# Узнаем какого разрешения файл по ссылке
-def get_file_extension(url):
-    parsed_url = urlparse(url)
-    path = parsed_url.path  # Достаем путь из ссылки
-    extension = path.split('.')[-1]  # Берем последнее слово после точки
-    return extension.lower()  # Возвращаем в нижнем регистре
-
 
 async def fetch_html(url):
     """Асинхронный запрос к сайту."""
@@ -686,5 +508,6 @@ if __name__ == "__main__":
     # 4. Запускаем бота (Polling)
     # Это блокирующая операция, которая сама обрабатывает сигналы systemd
     logger.info("Bot started via PTB Application")
-    application.run_polling()
+    # Запуск с запросом на удаление вебхука и сброс накопившейся очереди
+    application.run_polling(drop_pending_updates=True)
 
