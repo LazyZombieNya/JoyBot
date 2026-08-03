@@ -147,21 +147,35 @@ def _fit_telegram_photo_dimensions(img):
     Разрезает длинное изображение на равные части по вертикали.
     Режет только "вытянутые" картинки (комиксы/свитки).
     """
+
+
 def split_long_image(image_path, max_height=4000):
     img = Image.open(image_path)
     width, height = img.size
 
-    # КОЭФФИЦИЕНТ ВЫТЯНУТОСТИ:
-    # Делим высоту на ширину.
-    # Если картинка шире своей высоты (пейзаж) или почти квадратная,
-    # коэффициент будет меньше 1.5. Мы такие картинки не режем!
-    # Они пойдут в функцию compress_image и аккуратно сожмутся.
-    if height <= max_height or (height / width) < 1.5:
+    ratio = height / width if width > 0 else 0
+    filename = os.path.basename(image_path)
+
+    print(f"[АЛИЗ КАРТИНКИ] {filename} | Размер: {width}x{height} | Отношение (Высота/Ширина): {ratio:.2f}")
+
+    # Не режем, если это обычный арт (соотношение меньше 2.5)
+    # Если при этом он выше 4000px, compress_image сожмет его пропорционально.
+    if ratio < 2.5:
+        print(f"[АЛИЗ КАРТИНКИ] -> Пропускаем обрезку. Причина: Отношение ({ratio:.2f}) < 2.5 (не комикс)")
         return [image_path]
 
-    # Вычисляем количество частей и высоту каждой из них
-    num_parts = math.ceil(height / max_height)
+    # ДИНАМИЧЕСКИЙ РАСЧЕТ ВЫСОТЫ
+    # Чтобы было удобно читать, высота куска не должна превышать ширину более чем в 3 раза.
+    comfortable_chunk_height = width * 3.0
+
+    # Итоговая целевая высота: берем комфортную, но не позволяем ей перевалить за лимит ТГ (4000)
+    target_height = min(max_height, comfortable_chunk_height)
+
+    # Вычисляем количество частей на основе нашей целевой высоты
+    num_parts = math.ceil(height / target_height)
     part_height = math.ceil(height / num_parts)
+
+    print(f"[АЛИЗ КАРТИНКИ] -> Вытянутый формат! Режем на {num_parts} частей (высота каждой ~{part_height}px)")
 
     parts = []
     base_dir = os.path.dirname(image_path)
@@ -169,7 +183,6 @@ def split_long_image(image_path, max_height=4000):
 
     for i in range(num_parts):
         top = i * part_height
-        # Убеждаемся, что нижняя граница не выходит за пределы картинки
         bottom = min((i + 1) * part_height, height)
 
         box = (0, top, width, bottom)
@@ -188,11 +201,20 @@ def split_long_image(image_path, max_height=4000):
 async def compress_image(image_path_or_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 1024):
     if isinstance(image_path_or_bytes, bytes):
         img = Image.open(BytesIO(image_path_or_bytes))
+        file_name = "bytes_image"
     else:
         img = Image.open(image_path_or_bytes)
+        file_name = os.path.basename(image_path_or_bytes)
 
+    orig_w, orig_h = img.size
     img = img.convert("RGB")
+
+    # Подгоняем под лимиты Telegram
     img = _fit_telegram_photo_dimensions(img)
+    fit_w, fit_h = img.size
+
+    if orig_w != fit_w or orig_h != fit_h:
+        print(f"[СЖАТИЕ] {file_name} | Обрезан лимитами ТГ: {orig_w}x{orig_h} -> {fit_w}x{fit_h}")
 
     quality = 90
     while True:
@@ -201,15 +223,26 @@ async def compress_image(image_path_or_bytes, max_size=MAX_SIZE_IMG_MB * 1024 * 
         size = output.tell()
 
         if size <= max_size:
+            print(f"[СЖАТИЕ] {file_name} | Успех: {fit_w}x{fit_h}, качество {quality}%, вес {size / 1024:.2f} KB")
             return output.getvalue()
+
         if quality > 50:
+            print(
+                f"[СЖАТИЕ] {file_name} | Вес {size / 1024 / 1024:.2f} MB > {max_size / 1024 / 1024:.0f} MB. Снижаем качество до {quality - 5}%")
             quality -= 5
             continue
 
         width, height = img.size
         if width < 1000 or height < 1000:
+            print(
+                f"[СЖАТИЕ] {file_name} | Достигнут предел (ширина/высота < 1000). Оставляем {width}x{height}, {size / 1024:.2f} KB")
             return output.getvalue()
-        img = img.resize((int(width * 0.9), int(height * 0.9)), Image.LANCZOS)
+
+        # Уменьшаем разрешение, если не влезли по весу
+        new_w, new_h = int(width * 0.9), int(height * 0.9)
+        print(f"[СЖАТИЕ] {file_name} | Уменьшаем разрешение: {width}x{height} -> {new_w}x{new_h}")
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        fit_w, fit_h = new_w, new_h  # Обновляем для логов
 
 def _pick_scale(video_bitrate):
     if video_bitrate >= 2_500_000:

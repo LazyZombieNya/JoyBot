@@ -3,9 +3,9 @@ import html
 import logging
 import os
 import pickle
+import sys
 import uuid
 from collections import deque, Counter, defaultdict
-from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, urlunparse
 
 import aiofiles
@@ -16,6 +16,7 @@ from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, ContextTypes, AIORateLimiter
 from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError, RetryAfter
 
 from media_processor import download_media, clear_data_folder
 
@@ -35,20 +36,16 @@ UNWANTED_TAGS =os.getenv("UNWANTED_TAGS", "").split(",")  # Нежелатель
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
     raise ValueError("Error: (.env) Environment variables not set!")
-    
-# Создаём папку logs, если её нет
-os.makedirs("logs", exist_ok=True)
-#Логирование с ограничением 5 шт по 10мб.
-handler = RotatingFileHandler("logs/joybot.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")
+
+# Настраиваем логирование прямо в консоль (stdout) для Docker/Portainer
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[handler] # Добавить, logging.StreamHandler() чтобы логи выходили в консоль
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("JoyBot")
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Устанавливаем таймауты (убираем ошибку timeout)
@@ -64,6 +61,7 @@ SAVE_FILE = "sent_posts.pkl"# Файл данными об отправленн�
 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))  # Словарь с обработанными постами (отдельно для каждого сайта) с авто удалением старых записей
 
 MAX_POSTS = 30
+recorded_sent_posts = False  # Флаг наличия несохраненных отправленных постов
 
 #Загрузка отправленных постов sent_posts из файла SAVE_FILE
 async def load_sent_posts(app: Application):
@@ -84,7 +82,7 @@ async def load_sent_posts(app: Application):
 
 #Сохранение отправленных постов sent_posts в файл SAVE_FILE
 async def save_sent_posts(app: Application):
-    logger.info("Saving data before exiting...")
+    #logger.info("Saving data before exiting...")
     #print(f"Сохраняем данные: {sent_posts}")
 
     # Преобразуем defaultdict в обычный dict, иначе pickle не сможет его сохранить
@@ -92,34 +90,102 @@ async def save_sent_posts(app: Application):
     try:
         async with aiofiles.open(SAVE_FILE, "wb") as file:
             await file.write(pickle.dumps(normal_dict))        
-        logger.info("Data saved successfully!")
+        #logger.info("Data saved successfully!")
     except Exception as e:        
         logger.info(f"Error while saving: {e}")
+
+# Список ошибок при которых будет производиться попытка повторной отправки
+def is_retryable_error(e):
+    if isinstance(e, (TimedOut, NetworkError, RetryAfter)):
+        return True
+    text = str(e).lower()
+
+    retry_texts = [
+        "timed out",
+        "timeout",
+        "networkerror",
+        "connecterror",
+        "all connection attempts failed",
+        "cannot connect to host",
+        "getaddrinfo failed",
+        "connection reset",
+        "server disconnected",
+        "retry after",
+        "flood control",
+        "bad gateway",
+        "gateway timeout",
+        "webpage_media_empty",
+        "webpage_curl_failed",
+    ]
+    return any(t in text for t in retry_texts)
+
 
 # Функция для парсинга одного поста из joy.reactor.cc
 def parse_joy_post(post):
     post_data = {"content": []}
     text_content = []
 
-    # Работаем с текстом (H2), теги
+    # 1. Сначала работаем с тегами (H2). Если есть стоп-теги — сразу прерываемся.
     for H2 in post.find_all('h2'):
         text = H2.get_text(", ", strip=True)
         if text:
-            if any(tag in text for tag in UNWANTED_TAGS):  # Проверка поста на не желательные теги
-                post_data.clear()
+            if any(tag in text for tag in UNWANTED_TAGS):  # Проверка поста на нежелательные теги
                 return {}, []  # Завершаем функцию, пост не обрабатывается
             else:
                 post_data["content"].append(
                     {"id": str(uuid.uuid4()), "type": "h2", "data": html.escape(text) + "\n", "send": "yes"})
 
-    # Работаем с текстом (H3)
+    # 2. Изолируем и обрабатываем "Отличные комментарии" ДО того как парсить остальной текст
+    best_comments_text = []
+    for comment_block in post.find_all('div', class_='post_comment_list'):
+        # Ищем комментарии с заливкой (это и есть "Отличные" / "Лучшие")
+        best_comments = comment_block.find_all('div', class_='comment filled')
+
+        if best_comments and not best_comments_text:
+            best_comments_text.append("\n\n💬 <b>Отличные комментарии:</b>\n")
+
+        for comment in best_comments:
+            content_div = comment.find('div', class_='comment-content')
+            if content_div:
+                # Извлекаем никнейм автора
+                author_tag = comment.find('a', class_='comment_username')
+                author = html.escape(author_tag.get_text(strip=True)) if author_tag else "Аноним"
+
+                # Ищем картинки внутри комментария
+                for img_div in content_div.find_all('div', class_='image'):
+                    img = img_div.find('img')
+                    if img and img.get('src'):
+                        img_url = img.get('src')
+                        # Джойреактор часто отдает ссылки без https:, исправляем это
+                        if img_url.startswith('//'):
+                            img_url = "https:" + img_url
+
+                        # Добавляем картинку из коммента в общую группу медиа поста
+                        post_data["content"].append({
+                            "id": str(uuid.uuid4()),
+                            "type": "photo",
+                            "data": img_url,
+                            "send": "not"
+                        })
+                    # ВАЖНО: Вырезаем блок картинки из HTML комментария, чтобы он не попал в текст
+                    img_div.decompose()
+
+                # Забираем чистый текст комментария (так как картинки мы уже вырезали строкой выше)
+                comment_text = content_div.get_text(strip=True)
+                if comment_text:
+                    best_comments_text.append(f"👤 <i>{author}</i>: {html.escape(comment_text)}\n")
+
+        # ВАЖНО: Полностью удаляем весь блок комментариев из DOM-дерева текущего поста!
+        # Теперь последующие циклы H3, P и IMAGE не найдут мусор из комментов.
+        comment_block.decompose()
+
+    # 3. Работаем с текстом (H3) основного поста
     for H3 in post.find_all('h3'):
         text = H3.get_text(strip=True)
         if text:
-            # post_data["content"].append({"type": "text", "data": text + "\n","send": "not"})
             text_content.append(html.escape(text) + " \n")
 
-    # Работаем с текстом (p) и ссылками внутри него a href
+    # 4. Работаем с текстом (p) и ссылками внутри него a href
     for p in post.find_all('p'):
         parts = []
 
@@ -145,7 +211,7 @@ def parse_joy_post(post):
         if parts:
             text_content.append(", ".join(parts) + " \n")
 
-    # Работаем с <div class="image">
+    # 5. Работаем с <div class="image"> основного поста
     for img_div in post.find_all('div', class_='image'):
         img_tag = ""
         for video_span in img_div.find_all('span', class_='video_holder'):  # если тег image для видео
@@ -183,7 +249,7 @@ def parse_joy_post(post):
                 post_data["content"].append(
                     {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + img_url, "send": "not"})
 
-    # Работаем с <iframe это coub, youtube, vimeo
+    # 6. Работаем с <iframe это coub, youtube, vimeo
     for iframe in post.find_all('iframe'):
         iframe_url = iframe.get('src')
         if iframe_url:
@@ -210,8 +276,11 @@ def parse_joy_post(post):
             post_data["content"].append(
                 {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"})
 
-    return post_data, text_content
+    # 7. Приклеиваем текст собранных лучших комментариев в самый низ поста
+    if best_comments_text:
+        text_content.extend(best_comments_text)
 
+    return post_data, text_content
 
 # Функция для отправки текста в Telegram
 async def send_text_to_telegram(context: ContextTypes.DEFAULT_TYPE, chat_id, text_content, caption):
@@ -367,15 +436,26 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                             item["send"] = "yes"
                             count_send_photo += 1
                 except Exception as e:
-                    print(f"Error in post {post_id}: {e}")
-                    # not_processed = True
+                    retry = is_retryable_error(e)
+                    status_text = "идет на повтор" if retry else "пропущен (закрыт)"
+                    logger.error(f"Error in post {post_id}: {type(e).__name__} ({e}). Статус: {status_text}")
+
                     for item in content_list:
-                        if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
+                        if item["id"] in id_photo:
                             if item["send"] == "not":
-                                item["send"] = "err"
+                                item["send"] = "err"  # При первой ошибке пробуем скачать локально
+                            elif retry:
+                                # Ошибка сети при отправке файла: оставляем статус 'err',
+                                # чтобы на следующем круге цикла попытаться снова.
+                                pass
                             else:
-                                item["send"] = "close"
-                                count_send_photo += 1                
+                                item["send"] = "close"  # Фатальная ошибка, закрываем
+                                count_send_photo += 1
+
+                    if retry:
+                        # Если сеть отвалилась, делаем паузу перед повторным кругом цикла,
+                        # чтобы не уйти в бесконечный моментальный спам запросами
+                        await asyncio.sleep(10)
                 photo_group.clear()
                 id_photo.clear()
 
@@ -453,7 +533,9 @@ async def fetch_html(url):
 
 # Основной цикл для проверки новых постов
 async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
+    global recorded_sent_posts
     post_id = 0
+    has_new_posts = False  # Флаг, отслеживающий появление постов именно в этот проход
     try:
         for url in URLS:
             html_text = await fetch_html(url)
@@ -473,8 +555,18 @@ async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
                                         text_content=text_content)
 
                     processed_posts[url].append(post_id)  # помечаем что пост отправлен
+
+                    # Включаем флаги сохранения
+                    has_new_posts = True
+                    recorded_sent_posts = True
+
                     # Небольшая пауза между постами, чтобы не спамить
                     await asyncio.sleep(5)
+        # Если цикл завершился, новых постов не было, НО висят несохраненные данные с прошлых раз
+        if not has_new_posts and recorded_sent_posts:
+            await save_sent_posts(context.application)
+            recorded_sent_posts = False
+
     except Exception as e:
         print(f"Error in post {post_id}: {e}")
 
