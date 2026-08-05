@@ -12,7 +12,7 @@ import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAnimation
+from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAnimation, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, ContextTypes, AIORateLimiter
 from telegram.request import HTTPXRequest
@@ -124,161 +124,204 @@ def is_retryable_error(e):
 def parse_joy_post(post):
     post_data = {"content": []}
     text_content = []
+    comment_media = []
 
-    # 1. Сначала работаем с тегами (H2). Если есть стоп-теги — сразу прерываемся.
+    # 1. Работаем с тегами (H2)
     for H2 in post.find_all('h2'):
-        text = H2.get_text(", ", strip=True)
-        if text:
-            if any(tag in text for tag in UNWANTED_TAGS):  # Проверка поста на нежелательные теги
-                return {}, []  # Завершаем функцию, пост не обрабатывается
+        raw_text = H2.get_text(", ", strip=True)
+        if raw_text:
+            if any(tag in raw_text for tag in UNWANTED_TAGS):
+                return {}, []
             else:
+                tags = [t.strip() for t in raw_text.split(",")]
+                formatted_tags_list = [f"<code>{html.escape(t)}</code>" for t in tags if t]
+                formatted_tags = ", ".join(formatted_tags_list)
                 post_data["content"].append(
-                    {"id": str(uuid.uuid4()), "type": "h2", "data": html.escape(text) + "\n", "send": "yes"})
+                    {"id": str(uuid.uuid4()), "type": "h2", "data": formatted_tags, "send": "yes"})
 
-    # 2. Изолируем и обрабатываем "Отличные комментарии" ДО того как парсить остальной текст
+    # 2. Изолируем и обрабатываем "Отличные комментарии"
     best_comments_text = []
-    for comment_block in post.find_all('div', class_='post_comment_list'):
-        # Ищем комментарии с заливкой (это и есть "Отличные" / "Лучшие")
-        best_comments = comment_block.find_all('div', class_='comment filled')
+    filled_comments = post.find_all('div', id=lambda x: x and x.startswith('best_comment_'))
 
-        if best_comments and not best_comments_text:
-            best_comments_text.append("\n\n💬 <b>Отличные комментарии:</b>\n")
+    if filled_comments:
+        logger.info(f"Парсинг: Найдено отличных комментариев - {len(filled_comments)}")
+        best_comments_text.append("\n\n💬 <b>Отличные комментарии:</b>\n")
 
-        for comment in best_comments:
+        for comment in filled_comments:
             content_div = comment.find('div', class_='comment-content')
-            if content_div:
-                # Извлекаем никнейм автора
-                author_tag = comment.find('a', class_='comment_username')
-                author = html.escape(author_tag.get_text(strip=True)) if author_tag else "Аноним"
+            if not content_div: continue
 
-                # Ищем картинки внутри комментария
-                for img_div in content_div.find_all('div', class_='image'):
+            if content_div.find('div', class_='txt') and "Нажмите, чтобы показать" in content_div.get_text():
+                continue
+
+            author_tag = comment.find('a', class_='comment_username')
+            author = html.escape(author_tag.get_text(strip=True)) if author_tag else "Аноним"
+            has_media = False
+
+            for iframe in content_div.find_all('iframe'):
+                iframe_url = iframe.get('src')
+                if iframe_url:
+                    parsed = urlparse(iframe_url)
+                    clean_url = f"https://{parsed.netloc}{parsed.path}"
+                    if 'youtube.com' in clean_url:
+                        clean_url = clean_url.replace('/embed/', '/watch?v=')
+                    elif 'coub.com' in clean_url:
+                        clean_url = clean_url.replace('/embed/', '/view/')
+                    elif 'vimeo.com' in clean_url:
+                        clean_url = clean_url.replace('/video/', '/')
+                    comment_media.append(
+                        {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"})
+                    has_media = True
+                iframe.decompose()
+
+            for img_div in content_div.find_all('div', class_='image'):
+                img_tag = ""
+                for video_span in img_div.find_all('span', class_='video_holder'):
+                    img_tag = "video"
+                    source = video_span.find('source', type="video/mp4")
+                    if source: comment_media.append(
+                        {"id": str(uuid.uuid4()), "type": "video", "data": "https:" + source.get('src'), "send": "not"})
+
+                for gif_span in img_div.find_all('span', class_='video_gif_holder'):
+                    img_tag = "gif"
+                    source = gif_span.find('source', type="video/mp4")
+                    if source:
+                        comment_media.append(
+                            {"id": str(uuid.uuid4()), "type": "video", "data": "https:" + source.get('src'),
+                             "send": "not"})
+                    else:
+                        a_tag = gif_span.find('a')
+                        if a_tag: comment_media.append(
+                            {"id": str(uuid.uuid4()), "type": "gif", "data": "https:" + a_tag.get('href'),
+                             "send": "not"})
+
+                for full_div in img_div.find_all('a', class_='prettyPhotoLink'):
+                    img_tag = "photo"
+                    comment_media.append(
+                        {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + full_div.get('href'),
+                         "send": "not"})
+
+                if not img_tag:
                     img = img_div.find('img')
                     if img and img.get('src'):
-                        img_url = img.get('src')
-                        # Джойреактор часто отдает ссылки без https:, исправляем это
-                        if img_url.startswith('//'):
-                            img_url = "https:" + img_url
+                        url = img['src']
+                        if url.startswith('//'): url = "https:" + url
+                        comment_media.append({"id": str(uuid.uuid4()), "type": "photo", "data": url, "send": "not"})
 
-                        # Добавляем картинку из коммента в общую группу медиа поста
-                        post_data["content"].append({
-                            "id": str(uuid.uuid4()),
-                            "type": "photo",
-                            "data": img_url,
-                            "send": "not"
-                        })
-                    # ВАЖНО: Вырезаем блок картинки из HTML комментария, чтобы он не попал в текст
-                    img_div.decompose()
+                has_media = True
+                img_div.decompose()  # Удаляем картинку из DOM комментария
 
-                # Забираем чистый текст комментария (так как картинки мы уже вырезали строкой выше)
-                comment_text = content_div.get_text(strip=True)
-                if comment_text:
-                    best_comments_text.append(f"👤 <i>{author}</i>: {html.escape(comment_text)}\n")
+            comment_text = content_div.get_text(separator=" ", strip=True)
+            if comment_text:
+                best_comments_text.append(f"👤 <i>{author}</i>: {html.escape(comment_text)}\n")
+            elif has_media:
+                best_comments_text.append(f"👤 <i>{author}</i>: [Прикрепленный медиафайл]\n")
 
-        # ВАЖНО: Полностью удаляем весь блок комментариев из DOM-дерева текущего поста!
-        # Теперь последующие циклы H3, P и IMAGE не найдут мусор из комментов.
-        comment_block.decompose()
+    # Уничтожаем блоки комментариев в оригинальном HTML
+    for comment_list in post.find_all('div', class_='post_comment_list'):
+        comment_list.decompose()
 
-    # 3. Работаем с текстом (H3) основного поста
-    for H3 in post.find_all('h3'):
-        text = H3.get_text(strip=True)
-        if text:
-            text_content.append(html.escape(text) + " \n")
+    # 3. Извлекаем медиа основного поста и УДАЛЯЕМ их теги
 
-    # 4. Работаем с текстом (p) и ссылками внутри него a href
-    for p in post.find_all('p'):
-        parts = []
-
-        # Проходим по всем элементам внутри <p>
-        for element in p.contents:
-            if element.name == "a":  # Если это ссылка
-                href = element.get("href")
-                link_text = element.get_text(strip=True)
-
-                # Ограничиваем длину текста внутри ссылки (например, 30 символов)
-                if len(link_text) > 30:
-                    link_text = link_text[:27] + "..."  # Обрезаем текст и добавляем "..."
-
-                full_link = f'<a href="{html.escape(href)}">{html.escape(link_text)}</a>'
-                parts.append(full_link)
-            elif isinstance(element, str):  # Если это обычный текст
-                parts.append(html.escape(element.strip()))
-            else:
-                # Если это тег с вложенным текстом (например, <b>, <i>, <u> и т.д.), извлекаем его текст
-                parts.append(html.escape(element.get_text(strip=True)))
-
-        # Объединяем текстовые части и добавляем в список
-        if parts:
-            text_content.append(", ".join(parts) + " \n")
-
-    # 5. Работаем с <div class="image"> основного поста
-    for img_div in post.find_all('div', class_='image'):
-        img_tag = ""
-        for video_span in img_div.find_all('span', class_='video_holder'):  # если тег image для видео
-            img_tag = "video_holder"
-            source_tag = video_span.find('source', type="video/mp4")
-            video_url = source_tag.get('src')
-            post_data["content"].append(
-                {"id": str(uuid.uuid4()), "type": "video", "data": "https:" + video_url, "send": "not"})
-
-        for video_gif_span in img_div.find_all('span', class_='video_gif_holder'):  # если тег image для gif
-            img_tag = "video_gif_holder"
-            source_tag = video_gif_span.find('source', type="video/mp4")
-            if source_tag:
-                img_url = source_tag.get('src')
-                type_content = "video"
-            else:
-                a_tag = video_gif_span.find('a')
-                img_url = a_tag.get('href')
-                type_content = "gif"
-            if img_url:
-                post_data["content"].append(
-                    {"id": str(uuid.uuid4()), "type": type_content, "data": "https:" + img_url, "send": "not"})
-
-        # Работаем с <div class="prettyPhotoLink">
-        for full_div in img_div.find_all('a', class_='prettyPhotoLink'):
-            img_tag = "prettyPhotoLink"
-            img_url = full_div.get('href')
-            post_data["content"].append(
-                {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + img_url, "send": "not"})
-
-        if img_tag == "":  # если тег image для картинок только
-            img = img_div.find('img')
-            if img and img.get('src'):
-                img_url = img['src']
-                post_data["content"].append(
-                    {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + img_url, "send": "not"})
-
-    # 6. Работаем с <iframe это coub, youtube, vimeo
+    # СНАЧАЛА ищем iframe, так как они лежат внутри div.image и могут удалиться раньше времени!
     for iframe in post.find_all('iframe'):
         iframe_url = iframe.get('src')
         if iframe_url:
             parsed = urlparse(iframe_url)
-            clean_path = parsed.path
-            netloc = parsed.netloc
-
-            # Удаляем параметры
-            clean_url = urlunparse((parsed.scheme, netloc, clean_path, '', '', ''))
-
-            # Преобразуем embed-ссылки
-            if 'youtube.com' in netloc and '/embed/' in clean_path:
-                video_id = clean_path.split('/embed/')[-1]
-                clean_url = f"https://www.youtube.com/watch?v={video_id}"
-
-            elif 'coub.com' in netloc and '/embed/' in clean_path:
-                video_id = clean_path.split('/embed/')[-1]
-                clean_url = f"https://coub.com/view/{video_id}"
-
-            elif 'player.vimeo.com' in netloc and '/video/' in clean_path:
-                video_id = clean_path.split('/video/')[-1]
-                clean_url = f"https://vimeo.com/{video_id}"
-
+            clean_url = f"https://{parsed.netloc}{parsed.path}"
+            if 'youtube.com' in clean_url:
+                clean_url = clean_url.replace('/embed/', '/watch?v=')
+            elif 'coub.com' in clean_url:
+                clean_url = clean_url.replace('/embed/', '/view/')
+            elif 'vimeo.com' in clean_url:
+                clean_url = clean_url.replace('/video/', '/')
             post_data["content"].append(
                 {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"})
 
-    # 7. Приклеиваем текст собранных лучших комментариев в самый низ поста
+        iframe.decompose()
+
+    # ПОТОМ обрабатываем div.image (теперь оттуда безопасно удалять элементы)
+    for img_div in post.find_all('div', class_='image'):
+        img_tag = ""
+        for video_span in img_div.find_all('span', class_='video_holder'):
+            img_tag = "video"
+            source = video_span.find('source', type="video/mp4")
+            if source: post_data["content"].append(
+                {"id": str(uuid.uuid4()), "type": "video", "data": "https:" + source.get('src'), "send": "not"})
+
+        for gif_span in img_div.find_all('span', class_='video_gif_holder'):
+            img_tag = "gif"
+            source = gif_span.find('source', type="video/mp4")
+            if source:
+                post_data["content"].append(
+                    {"id": str(uuid.uuid4()), "type": "video", "data": "https:" + source.get('src'), "send": "not"})
+            else:
+                a_tag = gif_span.find('a')
+                if a_tag: post_data["content"].append(
+                    {"id": str(uuid.uuid4()), "type": "gif", "data": "https:" + a_tag.get('href'), "send": "not"})
+
+        for full_div in img_div.find_all('a', class_='prettyPhotoLink'):
+            img_tag = "photo"
+            post_data["content"].append(
+                {"id": str(uuid.uuid4()), "type": "photo", "data": "https:" + full_div.get('href'), "send": "not"})
+
+        if not img_tag:
+            img = img_div.find('img')
+            if img and img.get('src'):
+                url = img['src']
+                if url.startswith('//'): url = "https:" + url
+                post_data["content"].append({"id": str(uuid.uuid4()), "type": "photo", "data": url, "send": "not"})
+
+        # ВАЖНО: Удаляем блок картинки из HTML.
+        img_div.decompose()
+
+    # 4. Собираем чистый текст основного поста (теперь он без мусора от медиа)
+    post_content_div = post.find('div', class_='post_content')
+    if post_content_div:
+        inner_div = post_content_div.find('div')
+        if inner_div:
+            parts = []
+            # Перебираем ВСЕ дочерние элементы (и <p>, и <b>, и просто текст)
+            for element in inner_div.children:
+                if isinstance(element, str):
+                    text = element.strip()
+                    if text: parts.append(html.escape(text))
+                elif element.name == 'a':
+                    href = element.get("href")
+                    link_text = element.get_text(strip=True)
+                    if link_text and href:
+                        if len(link_text) > 30: link_text = link_text[:27] + "..."
+                        parts.append(f'<a href="{html.escape(href)}">{html.escape(link_text)}</a>')
+                elif element.name == 'p':
+                    # Если текст все же обернут в <p>
+                    for p_el in element.contents:
+                        if isinstance(p_el, str):
+                            t = p_el.strip()
+                            if t: parts.append(html.escape(t))
+                        elif p_el.name == 'a':
+                            href = p_el.get("href")
+                            link_text = p_el.get_text(strip=True)
+                            if link_text and href:
+                                if len(link_text) > 30: link_text = link_text[:27] + "..."
+                                parts.append(f'<a href="{html.escape(href)}">{html.escape(link_text)}</a>')
+                        else:
+                            t = p_el.get_text(strip=True)
+                            if t: parts.append(html.escape(t))
+                else:
+                    # Ловит <b>, <h3>, <span> и прочие теги, которые лепят авторы
+                    t = element.get_text(strip=True)
+                    if t: parts.append(html.escape(t))
+
+            if parts:
+                text_content.append(" ".join(parts) + "\n")
+
+    # 5. Приклеиваем текст собранных лучших комментариев
     if best_comments_text:
         text_content.extend(best_comments_text)
+
+    # 6. ВАЖНО: Добавляем медиа из комментариев в самый конец
+    if comment_media:
+        post_data["content"].extend(comment_media)
 
     return post_data, text_content
 
@@ -290,231 +333,279 @@ async def send_text_to_telegram(context: ContextTypes.DEFAULT_TYPE, chat_id, tex
         parts = [message[i:i + LIMIT_TEXT_MSG] for i in range(0, len(message), LIMIT_TEXT_MSG)]
 
         for part in parts:
+            if not part.strip():
+                continue # Защита от пустых кусков
             try:
                 await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
             except Exception as e:
                 print(f"Text error: {e}")
-                await context.bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
-            await asyncio.sleep(30)  # задержка в 30 секунд чтобы не срабатывал Flood control exceeded
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=html.escape(part), parse_mode=ParseMode.HTML)
+                except Exception as inner_e:
+                    print(f"Failed to send text fallback: {inner_e}")
+            await asyncio.sleep(30)
 
 
-# Функция для отправки медиа-группы в Telegram
+# --- Разделяем медиа на группы MAX_MEDIA_PER_GROUP ---
+async def _process_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, media_objects, related_items,
+                               caption=None):
+    """
+    Разбивает медиагруппу на чанки по 10 штук и безопасно отправляет.
+    Если передан caption, он добавляется только к самому последнему чанку в группе.
+    Возвращает True, если caption был успешно отправлен, иначе False.
+    """
+    caption_sent_here = False
+
+    while media_objects:
+        chunk = media_objects[:MAX_MEDIA_PER_GROUP]
+        chunk_items = related_items[:MAX_MEDIA_PER_GROUP]
+
+        is_last_chunk = len(media_objects) <= MAX_MEDIA_PER_GROUP
+
+        # Если это последний чанк и нам выдали caption — прикрепляем его к первому файлу чанка
+        if is_last_chunk and caption:
+            first_media = chunk[0]
+            if isinstance(first_media, InputMediaPhoto):
+                chunk[0] = InputMediaPhoto(media=first_media.media, caption=caption, parse_mode="HTML")
+            elif isinstance(first_media, InputMediaVideo):
+                chunk[0] = InputMediaVideo(media=first_media.media, caption=caption, parse_mode="HTML")
+
+        try:
+            await context.bot.send_media_group(chat_id=chat_id, media=chunk)
+            #logger.info(f"Post {post_id} - Sent media chunk ({len(chunk)} items)")
+
+            if is_last_chunk and caption:
+                caption_sent_here = True
+
+            # Помечаем оригинальные элементы словаря как отправленные
+            for item in chunk_items:
+                item["send"] = "yes"
+
+            # Убираем успешный чанк из очереди
+            media_objects = media_objects[MAX_MEDIA_PER_GROUP:]
+            related_items = related_items[MAX_MEDIA_PER_GROUP:]
+
+            if media_objects:
+                await asyncio.sleep(3)  # Небольшая пауза между кусками большого альбома
+
+        except Exception as e:
+            retry = is_retryable_error(e)
+            status_text = "идет на повтор" if retry else "пропущен (закрыт)"
+            logger.error(f"Error in post {post_id}: {type(e).__name__} ({e}). Статус: {status_text}")
+
+            for item in chunk_items:
+                if item["send"] == "not":
+                    item["send"] = "err"
+                elif not retry:
+                    item["send"] = "close"
+
+            if retry:
+                await asyncio.sleep(10)
+
+            break  # При ошибке прерываем цикл чанков, остатки подхватит внешний цикл
+
+    return caption_sent_here
+
+
+# --- Основная функция отправки постов ---
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
-    photo_group = []
-    id_photo = []
-    video_group = []
-    id_video = []
-    gif_group = []
-    id_gif = []
+    content_list = contents.get("content", [])
+    title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '
 
-    content_list = contents.get("content", [])  # Получаем список вложений
-    title = next((item["data"] for item in content_list if item["type"] == "h2"),
-                 "")  # теги, которые находятся в заголовке H2
-    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '  # Эта будет ссылкой на пост
-    type_counts = Counter(item['type'] for item in content_list)  # Считаем количество типов файлов в json
+    # Формируем базовое описание
+    base_caption = link_post + title+"\n"
+    post_caption = base_caption
 
-    # Ограничение размера группы перед отправкой
-    # if len(media_content) > 20:  # Задайте разумный предел, например, 50 элементов
-    #    print(f"Слишком много медиафайлов: {len(media_content)}. Отправка частями.")
-    #    media_content = media_content[:30]  # Обрежьте до первых 50
+    # Проверяем, есть ли в посте вообще хоть какое-то медиа
+    has_media = any(item["type"] in ["photo", "video", "gif", "video_hosting"] for item in content_list)
 
-    if text_content and (sum(len(text) for text in text_content) + len(title + "\n") + len(link_post)) < LIMIT_CAPTION:
-        caption = link_post + title + "\n" + "".join(text_content)
-        text_content.clear()
-    else:
-        caption = link_post + title
+    # 1. РАБОТАЕМ С ТЕКСТОМ (Отправляем длинный текст ДО медиа)
+    if text_content:
+        if has_media:
+            # Если текст влезет в лимит подписи - объединяем, он уйдет в самом конце альбома
+            if (sum(len(text) for text in text_content) + len(base_caption + "\n")) < LIMIT_CAPTION:
+                post_caption = base_caption + "\n" + "".join(text_content)
+                text_content.clear()
+            else:
+                # Текст не влезает! Отправляем его СЕЙЧАС отдельным сообщением (без подписи)
+                await send_text_to_telegram(context, chat_id, text_content, "")
+                text_content.clear()
+                # post_caption остается просто базовым (ссылка + заголовок)
+        else:
+            # Медиа нет вообще (только текст). Мы его пока не трогаем, он улетит в самом низу функции вместе с подписью
+            pass
 
-    count_send_photo = 0
-    count_send_video = 0
-    count_send_gif = 0
-    not_processed = True  # Флаг отслеживания все ли обработано в посте
-    everything_sent = True  # Флаг для отслеживания все ли отправлено
+    caption_sent = not has_media  # Если медиа нет, считать что мы "закончили" с прикреплением
+    not_processed = True
+    everything_sent = True
+
+    # 2. ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ МЕДИА
     while not_processed:
         not_processed = False
-        for index, content in enumerate(content_list):
+
+        photo_group, photo_items = [], []
+        video_group, video_items = [], []
+        gif_group, gif_items = [], []
+        video_hosting_group = []
+
+        # СОБИРАЕМ МЕДИА-КОНТЕНТ (без caption!)
+        for content in content_list:
             if content["send"] == "yes":
-                continue  # Уже отправленные файлы пропускаем
+                continue
             elif content["send"] == "close":
                 everything_sent = False
-                continue  # Те файлы, что так и не получилось отправить так же пропускаем, но помечаем что не все отправлено
+                continue
             else:
                 not_processed = True
 
-            if content["type"] == "photo":  # Если контент картинка
-                match content["send"]:
-                    case "not":
-                        photo_group.append(
-                            InputMediaPhoto(media=content["data"],
-                                            caption=(caption if not photo_group else None),
-                                            parse_mode="HTML"))
-                        id_photo.append(content["id"])
-                    case "err":
-                        # Качаем файл если по ссылке не отправляется
-                        downloaded_files = await download_media(content["data"])
-                        if downloaded_files:
-                            # Проходим циклом, так как media_processor возвращает список
-                            for file_path in downloaded_files:
-                                with open(file_path, 'rb') as file:
-                                    photo_group.append(InputMediaPhoto(
-                                        media=file.read(),
-                                        caption=(caption if not photo_group else None),
-                                        parse_mode="HTML"))
-                        else:
-                            content["send"] = "close"
-                        id_photo.append(content["id"])
+            media_type = content["type"]
 
-            elif content["type"] == "video":
-                match content["send"]:
-                    case "not":
-                        video_group.append(InputMediaVideo(media=content["data"],
-                                                           caption=(caption if not video_group else None),
-                                                           parse_mode="HTML"))
-                        id_video.append(content["id"])
-                    case "err":  # Пробуем качать видео на диск
-                        downloaded_files = await download_media(content["data"])
-                        if downloaded_files:
-                            for file_path in downloaded_files:
-                                video_group.append(InputMediaVideo(
-                                    media=open(file_path, 'rb'),
-                                    caption=(caption if not video_group else None),
-                                    parse_mode="HTML"
-                                ))
-                        else:
-                            content["send"] = "close"
-                        id_video.append(content["id"])
-
-            elif content["type"] == "gif":
-                match content["send"]:
-                    case "not":
-                        gif_group.append(InputMediaAnimation(media=content["data"],
-                                                             caption=(caption if not gif_group else None),
-                                                             parse_mode="HTML"))
-                        id_gif.append(content["id"])
-                    case "err":  # Пробуем качать видео на диск
-                        downloaded_files = await download_media(content["data"])
-                        if downloaded_files:
-                            for file_path in downloaded_files:
-                                gif_group.append(InputMediaAnimation(
-                                    media=open(file_path, 'rb'),
-                                    caption=(caption if not gif_group else None),
-                                    parse_mode="HTML"
-                                ))
-                        else:
-                            content["send"] = "close"
-                        id_gif.append(content["id"])
-                    case "err":  # Пробуем качать видео на диск
-                        downloaded_file = await download_media(content["data"])
-                        if downloaded_file:
-                            gif_group.append(InputMediaAnimation(
-                                media=open(downloaded_file, 'rb'),
-                                caption=(caption if not gif_group else None),
-                                parse_mode="HTML"
-                            ))
-                        else:
-                            content["send"] = "close"
-                        id_gif.append(content["id"])
-            elif content["type"] == "video_hosting":
+            if media_type == "photo":
                 if content["send"] == "not":
-                    video_url = content["data"]
-                    text = f'<a href="{video_url}">📺 Смотреть видео</a> \n\n {caption}'
+                    photo_group.append(InputMediaPhoto(media=content["data"], parse_mode="HTML"))
+                    photo_items.append(content)
+                elif content["send"] == "err":
+                    files = await download_media(content["data"])
+                    if files:
+                        for f_path in files:
+                            with open(f_path, 'rb') as file:
+                                photo_group.append(InputMediaPhoto(media=file.read(), parse_mode="HTML"))
+                                photo_items.append(content)
+                    else:
+                        content["send"] = "close"
 
-                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-                    content["send"] = "yes"
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=f'Не известный контент {link_post} {content["data"]}')
-                content["send"] = "close"
+            elif media_type == "video":
+                if content["send"] == "not":
+                    video_group.append(InputMediaVideo(media=content["data"], parse_mode="HTML"))
+                    video_items.append(content)
+                elif content["send"] == "err":
+                    files = await download_media(content["data"])
+                    if files:
+                        for f_path in files:
+                            video_group.append(InputMediaVideo(media=open(f_path, 'rb'), parse_mode="HTML"))
+                            video_items.append(content)
+                    else:
+                        content["send"] = "close"
 
-            if photo_group and (
-                    (len(photo_group) == MAX_MEDIA_PER_GROUP) or (
-                    len(photo_group) >= (type_counts.get('photo', 0) - count_send_photo)) or (
-                            index == len(content_list) - 1)):
+            elif media_type == "gif":
+                if content["send"] == "not":
+                    gif_group.append(InputMediaAnimation(media=content["data"], parse_mode="HTML"))
+                    gif_items.append(content)
+                elif content["send"] == "err":
+                    files = await download_media(content["data"])
+                    if files:
+                        for f_path in files:
+                            gif_group.append(InputMediaAnimation(media=open(f_path, 'rb'), parse_mode="HTML"))
+                            gif_items.append(content)
+                    else:
+                        content["send"] = "close"
+
+            elif media_type == "video_hosting" and content["send"] in ["not", "err"]:
+                video_hosting_group.append(content)
+
+        # --- ОТПРАВЛЯЕМ МЕДИА-КОНТЕНТ ---
+
+        # Вычисляем, какая группа будет отправляться самой последней в этой итерации
+        last_media_type = None
+        if video_hosting_group:
+            last_media_type = "video_hosting"
+        elif gif_group:
+            last_media_type = "gif"
+        elif video_group:
+            last_media_type = "video"
+        elif photo_group:
+            last_media_type = "photo"
+
+        if photo_group:
+            sent = await _process_media_group(
+                context, chat_id, post_id, photo_group, photo_items,
+                caption=post_caption if last_media_type == "photo" and not caption_sent else None
+            )
+            if sent: caption_sent = True
+
+        if video_group:
+            sent = await _process_media_group(
+                context, chat_id, post_id, video_group, video_items,
+                caption=post_caption if last_media_type == "video" and not caption_sent else None
+            )
+            if sent: caption_sent = True
+
+        if gif_group:
+            for i, (gif, item) in enumerate(zip(gif_group, gif_items)):
+                is_last_gif = (i == len(gif_group) - 1)
+                current_caption = post_caption if is_last_gif and last_media_type == "gif" and not caption_sent else None
+
                 try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=photo_group)
-                    logger.info(f"Post {post_id} - Send pict {len(photo_group)}: {photo_group}")
-                    for item in content_list:
-                        if item["id"] in id_photo:  # Проверяем, есть ли ID в списке
-                            item["send"] = "yes"
-                            count_send_photo += 1
+                    await context.bot.send_animation(chat_id=chat_id, animation=gif.media, caption=current_caption,
+                                                     parse_mode="HTML")
+                    logger.info(f"Post {post_id} - Sent gif")
+                    item["send"] = "yes"
+                    if current_caption:
+                        caption_sent = True
                 except Exception as e:
                     retry = is_retryable_error(e)
-                    status_text = "идет на повтор" if retry else "пропущен (закрыт)"
-                    logger.error(f"Error in post {post_id}: {type(e).__name__} ({e}). Статус: {status_text}")
-
-                    for item in content_list:
-                        if item["id"] in id_photo:
-                            if item["send"] == "not":
-                                item["send"] = "err"  # При первой ошибке пробуем скачать локально
-                            elif retry:
-                                # Ошибка сети при отправке файла: оставляем статус 'err',
-                                # чтобы на следующем круге цикла попытаться снова.
-                                pass
-                            else:
-                                item["send"] = "close"  # Фатальная ошибка, закрываем
-                                count_send_photo += 1
-
+                    logger.error(f"Error in post {post_id} (gif): {e}")
+                    if item["send"] == "not":
+                        item["send"] = "err"
+                    elif not retry:
+                        item["send"] = "close"
                     if retry:
-                        # Если сеть отвалилась, делаем паузу перед повторным кругом цикла,
-                        # чтобы не уйти в бесконечный моментальный спам запросами
                         await asyncio.sleep(10)
-                photo_group.clear()
-                id_photo.clear()
 
-            if video_group and (
-                    (len(video_group) == MAX_MEDIA_PER_GROUP) or (
-                    len(video_group) == type_counts.get('video', 0) - count_send_video) or (
-                            index == len(content_list) - 1)):
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=video_group)
-                    logger.info("Post %s - Send video %s",post_id, video_group)
-                    for item in content_list:
-                        if item["id"] in id_video:  # Проверяем, есть ли ID в списке
-                            item["send"] = "yes"
-                            count_send_video += 1
-                except Exception as e:
-                    print(f"Error in post {post_id}: {e}")
-                    # not_processed = True
-                    for item in content_list:
-                        if item["id"] in id_video:  # Проверяем, есть ли ID в списке
-                            if item["send"] == "not":
-                                item["send"] = "err"
-                            else:
-                                item["send"] = "close"
-                                count_send_video += 1                
-                video_group.clear()
-                id_video.clear()
+        if video_hosting_group:
+            for i, item in enumerate(video_hosting_group):
+                is_last_vh = (i == len(video_hosting_group) - 1)
+                current_caption = post_caption if is_last_vh and last_media_type == "video_hosting" and not caption_sent else None
 
-            if gif_group and ((len(gif_group) == MAX_MEDIA_PER_GROUP) or (
-                    len(gif_group) == type_counts.get('gif', 0) - count_send_gif) or (index == len(content_list) - 1)):
+                text = f'<a href="{item["data"]}">📺 Смотреть видео</a>'
+                if current_caption:
+                    text += f'\n\n{current_caption}'
+
                 try:
-                    for gif_file in gif_group:
-                        await context.bot.send_animation(chat_id=chat_id, animation=gif_file.media, caption=caption,
-                                                 parse_mode="HTML")
-                        logger.info("Post %s - Send gif %s",post_id, gif_group)
-                    for item in content_list:
-                        if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
-                            item["send"] = "yes"
-                            count_send_gif += 1
+                    # Сначала пробуем отправить С ПРЕВЬЮ
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                                   link_preview_options=LinkPreviewOptions(is_disabled=False))
+                    item["send"] = "yes"
+                    if current_caption:
+                        caption_sent = True
+
                 except Exception as e:
-                    print(f"Error in post {post_id}: {e}")
-                    # not_processed = True
-                    for item in content_list:
-                        if item["id"] in id_gif:  # Проверяем, есть ли ID в списке
-                            if item["send"] == "not":
-                                item["send"] = "err"
-                            else:
-                                item["send"] = "close"
-                                count_send_gif += 1                
-                gif_group.clear()
-                id_gif.clear()
-        if text_content:
-            await send_text_to_telegram(context,chat_id, text_content, caption)  # Отправляем длинные тексты
-            text_content.clear()
+                    # Если Телеграм не смог сгенерировать превью (ошибка webpage_media_empty)
+                    if "webpage" in str(e).lower():
+                        logger.warning(f"Превью не сгенерировалось для {item['data']}, отправляем без него.")
+                        try:
+                            # Запасной вариант: отправляем БЕЗ ПРЕВЬЮ
+                            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                                           link_preview_options=LinkPreviewOptions(is_disabled=True))
+                            item["send"] = "yes"
+                            if current_caption:
+                                caption_sent = True
+                        except Exception as inner_e:
+                            logger.error(f"Fallback error: {inner_e}")
+                            item["send"] = "err"
+                    else:
+                        # Обработка остальных сетевых ошибок (таймауты и т.д.)
+                        retry = is_retryable_error(e)
+                        if item["send"] == "not":
+                            item["send"] = "err"
+                        elif not retry:
+                            item["send"] = "close"
+                        if retry:
+                            await asyncio.sleep(10)
+
+    # 3. ОТПРАВЛЯЕМ ОСТАТКИ ТЕКСТА (Для постов, где вообще не было картинок)
+    if text_content:
+        # Так как медиа не было, текст дожил до конца функции. Отправляем его с базовым описанием.
+        await send_text_to_telegram(context, chat_id, text_content, base_caption)
+        text_content.clear()
+
     if not everything_sent:
         await context.bot.send_message(chat_id=chat_id,
-                               text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
-                               parse_mode=ParseMode.HTML)
+                                       text=link_post + "Не все удалось отправить, чтобы посмотреть нажмите на пост",
+                                       parse_mode=ParseMode.HTML)
 
-    await clear_data_folder()  # Удаляем скачанные файлы
+    await clear_data_folder()
 
 async def fetch_html(url):
     """Асинхронный запрос к сайту."""
