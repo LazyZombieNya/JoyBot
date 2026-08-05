@@ -1,0 +1,21 @@
+services:
+  joybot:
+    build: .
+    container_name: joybot
+    restart: unless-stopped
+
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_V=${TELEGRAM_CHAT_V}
+      - TELEGRAM_CHAT_PL=${TELEGRAM_CHAT_PL}
+      - URLS_V=${URLS_V}
+      - URLS_PL=${URLS_PL}
+      - UNWANTED_TAGS=${UNWANTED_TAGS}
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Yekaterinburg
+
+    volumes:
+      # Прокидываем файл с отправленными постами, чтобы история не стиралась при пересборке
+      - /opt/joybot/sent_posts.pkl:/app/sent_posts.pkl
+      # Папка для временных медиафайлов
+      - /temp_data/joybot:/app/temp_data
