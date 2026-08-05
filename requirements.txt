@@ -2,5 +2,6 @@ aiofiles
 aiohttp
 beautifulsoup4
 Pillow
+ffmpeg-python
 python-dotenv
 python-telegram-bot[rate-limiter,job-queue]
