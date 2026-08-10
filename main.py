@@ -411,10 +411,10 @@ async def _process_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id, post
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
     content_list = contents.get("content", [])
     title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
-    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> : '
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> :\n'
 
     # Формируем базовое описание
-    base_caption = link_post + title+"\n"
+    base_caption = link_post + title + "\n"
     post_caption = base_caption
 
     # Проверяем, есть ли в посте вообще хоть какое-то медиа
@@ -443,6 +443,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
     # 2. ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ МЕДИА
     while not_processed:
         not_processed = False
+        download_retry_occurred = False  # Флаг для паузы при ошибках скачивания
 
         photo_group, photo_items = [], []
         video_group, video_items = [], []
@@ -473,7 +474,14 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                                 photo_group.append(InputMediaPhoto(media=file.read(), parse_mode="HTML"))
                                 photo_items.append(content)
                     else:
-                        content["send"] = "close"
+                        # Возвращаем утерянную логику попыток скачивания!
+                        retries = content.get("retries", 0) + 1
+                        content["retries"] = retries
+                        if retries <= 3:
+                            download_retry_occurred = True
+                            logger.info(f"Retrying download for {content['data']} (Attempt {retries}/3)")
+                        else:
+                            content["send"] = "close"
 
             elif media_type == "video":
                 if content["send"] == "not":
@@ -486,7 +494,13 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                             video_group.append(InputMediaVideo(media=open(f_path, 'rb'), parse_mode="HTML"))
                             video_items.append(content)
                     else:
-                        content["send"] = "close"
+                        retries = content.get("retries", 0) + 1
+                        content["retries"] = retries
+                        if retries <= 3:
+                            download_retry_occurred = True
+                            logger.info(f"Retrying download for {content['data']} (Attempt {retries}/3)")
+                        else:
+                            content["send"] = "close"
 
             elif media_type == "gif":
                 if content["send"] == "not":
@@ -499,7 +513,13 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                             gif_group.append(InputMediaAnimation(media=open(f_path, 'rb'), parse_mode="HTML"))
                             gif_items.append(content)
                     else:
-                        content["send"] = "close"
+                        retries = content.get("retries", 0) + 1
+                        content["retries"] = retries
+                        if retries <= 3:
+                            download_retry_occurred = True
+                            logger.info(f"Retrying download for {content['data']} (Attempt {retries}/3)")
+                        else:
+                            content["send"] = "close"
 
             elif media_type == "video_hosting" and content["send"] in ["not", "err"]:
                 video_hosting_group.append(content)
@@ -563,7 +583,6 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                     text += f'\n\n{current_caption}'
 
                 try:
-                    # Сначала пробуем отправить С ПРЕВЬЮ
                     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                                    link_preview_options=LinkPreviewOptions(is_disabled=False))
                     item["send"] = "yes"
@@ -571,11 +590,9 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                         caption_sent = True
 
                 except Exception as e:
-                    # Если Телеграм не смог сгенерировать превью (ошибка webpage_media_empty)
                     if "webpage" in str(e).lower():
                         logger.warning(f"Превью не сгенерировалось для {item['data']}, отправляем без него.")
                         try:
-                            # Запасной вариант: отправляем БЕЗ ПРЕВЬЮ
                             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                                            link_preview_options=LinkPreviewOptions(is_disabled=True))
                             item["send"] = "yes"
@@ -585,7 +602,6 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                             logger.error(f"Fallback error: {inner_e}")
                             item["send"] = "err"
                     else:
-                        # Обработка остальных сетевых ошибок (таймауты и т.д.)
                         retry = is_retryable_error(e)
                         if item["send"] == "not":
                             item["send"] = "err"
@@ -594,9 +610,12 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
                         if retry:
                             await asyncio.sleep(10)
 
+        # Если были проблемы со скачиванием, ждем 5 секунд перед следующим кругом
+        if download_retry_occurred:
+            await asyncio.sleep(5)
+
     # 3. ОТПРАВЛЯЕМ ОСТАТКИ ТЕКСТА (Для постов, где вообще не было картинок)
     if text_content:
-        # Так как медиа не было, текст дожил до конца функции. Отправляем его с базовым описанием.
         await send_text_to_telegram(context, chat_id, text_content, base_caption)
         text_content.clear()
 
