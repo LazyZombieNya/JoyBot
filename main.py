@@ -411,10 +411,10 @@ async def _process_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id, post
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
     content_list = contents.get("content", [])
     title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
-    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a> :\n'
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a>'
 
     # Формируем базовое описание
-    base_caption = link_post + title + "\n"
+    base_caption = title + "\n" + link_post
     post_caption = base_caption
 
     # Проверяем, есть ли в посте вообще хоть какое-то медиа
