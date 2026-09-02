@@ -411,30 +411,39 @@ async def _process_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id, post
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
     content_list = contents.get("content", [])
     title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
-    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост {post_id}</a>'
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост на JoyReactor {post_id}</a>'
 
-    # Формируем базовое описание
-    base_caption = title + "\n" + link_post
-    post_caption = base_caption
+    # Подготавливаем заголовок
+    title_part = f"{title}\n\n" if title else ""
 
     # Проверяем, есть ли в посте вообще хоть какое-то медиа
     has_media = any(item["type"] in ["photo", "video", "gif", "video_hosting"] for item in content_list)
 
     # 1. РАБОТАЕМ С ТЕКСТОМ (Отправляем длинный текст ДО медиа)
     if text_content:
+        full_text = "".join(text_content)
         if has_media:
-            # Если текст влезет в лимит подписи - объединяем, он уйдет в самом конце альбома
-            if (sum(len(text) for text in text_content) + len(base_caption + "\n")) < LIMIT_CAPTION:
-                post_caption = base_caption + "\n" + "".join(text_content)
+            # Если всё влезает в лимит подписи - объединяем, ссылка будет в самом конце
+            if (len(title_part) + len(full_text) + len(link_post) + 2) < LIMIT_CAPTION:
+                post_caption = f"{title_part}{full_text}\n\n{link_post}"
                 text_content.clear()
             else:
-                # Текст не влезает! Отправляем его СЕЙЧАС отдельным сообщением (без подписи)
-                await send_text_to_telegram(context, chat_id, text_content, "")
+                # Текст не влезает! Отправляем заголовок вместе с текстом ДО медиа
+                await send_text_to_telegram(context, chat_id, [f"{title_part}{full_text}"], "")
                 text_content.clear()
-                # post_caption остается просто базовым (ссылка + заголовок)
+                # Описание поста (к медиа) теперь состоит только из ссылки
+                post_caption = link_post
         else:
-            # Медиа нет вообще (только текст). Мы его пока не трогаем, он улетит в самом низу функции вместе с подписью
-            pass
+            # Медиа нет вообще (только текст).
+            # Добавим заголовок в самое начало первого блока текста, а саму ссылку приклеим внизу функции
+            text_content[0] = title_part + text_content[0]
+            post_caption = ""
+    else:
+        # Текста нет, просто склеиваем заголовок и ссылку
+        post_caption = f"{title_part}{link_post}".strip()
+
+    # Формируем базовое описание для остатков текста (Шаг 3), если медиа нет
+    base_caption = f"\n\n{link_post}"
 
     caption_sent = not has_media  # Если медиа нет, считать что мы "закончили" с прикреплением
     not_processed = True
