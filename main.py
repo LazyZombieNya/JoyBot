@@ -413,37 +413,53 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, conten
     title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
     link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост на JoyReactor {post_id}</a>'
 
-    # Подготавливаем заголовок
-    title_part = f"{title}\n\n" if title else ""
-
-    # Проверяем, есть ли в посте вообще хоть какое-то медиа
+    # Проверяем, есть ли медиа
     has_media = any(item["type"] in ["photo", "video", "gif", "video_hosting"] for item in content_list)
 
-    # 1. РАБОТАЕМ С ТЕКСТОМ (Отправляем длинный текст ДО медиа)
-    if text_content:
-        full_text = "".join(text_content)
-        if has_media:
-            # Если всё влезает в лимит подписи - объединяем, ссылка будет в самом конце
-            if (len(title_part) + len(full_text) + len(link_post) + 2) < LIMIT_CAPTION:
-                post_caption = f"{title_part}{full_text}\n\n{link_post}"
-                text_content.clear()
-            else:
-                # Текст не влезает! Отправляем заголовок вместе с текстом ДО медиа
-                await send_text_to_telegram(context, chat_id, [f"{title_part}{full_text}"], "")
-                text_content.clear()
-                # Описание поста (к медиа) теперь состоит только из ссылки
-                post_caption = link_post
-        else:
-            # Медиа нет вообще (только текст).
-            # Добавим заголовок в самое начало первого блока текста, а саму ссылку приклеим внизу функции
-            text_content[0] = title_part + text_content[0]
-            post_caption = ""
-    else:
-        # Текста нет, просто склеиваем заголовок и ссылку
-        post_caption = f"{title_part}{link_post}".strip()
+    # Очищаем текст от лишних переносов в начале и конце
+    full_text = "".join(text_content).strip() if text_content else ""
 
-    # Формируем базовое описание для остатков текста (Шаг 3), если медиа нет
-    base_caption = f"\n\n{link_post}"
+    if has_media:
+        post_caption_parts = []
+        if title:
+            post_caption_parts.append(title.strip())
+
+        # Проверяем лимиты, если есть текст
+        if full_text:
+            # Считаем длину: теги + текст + ссылка + запасы на переносы "\n\n"
+            estimated_length = len(title) + len(full_text) + len(link_post) + 4
+            if estimated_length < LIMIT_CAPTION:
+                post_caption_parts.append(full_text)
+                text_content.clear()  # Текст уйдёт вместе с медиа в самом конце
+            else:
+                # Текст слишком длинный! Отправляем его отдельно ДО медиа (БЕЗ тегов и БЕЗ ссылки)
+                await send_text_to_telegram(context, chat_id, [full_text], "")
+                text_content.clear()
+
+        # Ссылка всегда в самом конце подписи к последнему медиа
+        post_caption_parts.append(link_post)
+
+        # Собираем всё аккуратно через двойной перенос, чтобы не было "дыр"
+        post_caption = "\n\n".join(post_caption_parts)
+        base_caption = ""
+
+    else:
+        # Медиа нет вообще (только текст)
+        text_parts = []
+        if title:
+            text_parts.append(title.strip())
+        if full_text:
+            text_parts.append(full_text)
+        text_parts.append(link_post)
+
+        # Подготавливаем для 3-го шага (отправка остатков текста в самом низу функции)
+        if text_parts:
+            text_content = ["\n\n".join(text_parts)]
+        else:
+            text_content = []
+
+        post_caption = ""
+        base_caption = ""
 
     caption_sent = not has_media  # Если медиа нет, считать что мы "закончили" с прикреплением
     not_processed = True
