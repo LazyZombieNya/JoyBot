@@ -411,7 +411,7 @@ async def _process_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id, post
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id, post_id, contents, text_content):
     content_list = contents.get("content", [])
     title = next((item["data"] for item in content_list if item["type"] == "h2"), "")
-    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост на JoyReactor {post_id}</a>'
+    link_post = f'<a href="https://m.joyreactor.cc/post/{post_id}">Пост на JoyReactor</a>'
 
     # Проверяем, есть ли медиа
     has_media = any(item["type"] in ["photo", "video", "gif", "video_hosting"] for item in content_list)
