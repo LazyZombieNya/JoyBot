@@ -21,34 +21,39 @@ from telegram.error import TimedOut, NetworkError, RetryAfter
 
 from media_processor import download_media, clear_data_folder
 
+# Загружаем переменные окружения из файла .env (токены, ссылки, настройки)
 load_dotenv()
 
-# Токен Telegram-бота и ID чатов
+# Чтение основных настроек из переменных окружения
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_V = os.getenv("TELEGRAM_CHAT_V")
-TELEGRAM_CHAT_PL = os.getenv("TELEGRAM_CHAT_PL")
+TELEGRAM_CHAT_V = os.getenv("TELEGRAM_CHAT_V") # ID первого чата
+TELEGRAM_CHAT_PL = os.getenv("TELEGRAM_CHAT_PL") # ID второго чата
 
-# URL сайтов
+# Парсинг списков URL-адресов, которые бот будет мониторить
 URLS_V = [u.strip() for u in os.getenv("URLS_V", "").split(",") if u.strip()]
 URLS_PL = [u.strip() for u in os.getenv("URLS_PL", "").split(",") if u.strip()]
 URLS = URLS_V + URLS_PL
 
+# Список тегов, посты с которыми бот должен игнорировать
 UNWANTED_TAGS = [t.strip() for t in os.getenv("UNWANTED_TAGS", "").split(",") if t.strip()]
 
+# Проверка наличия обязательных переменных
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_V:
     raise ValueError("Error: (.env) Environment variables not set!")
 
-# Логирование в stdout
+# Настройка системы логирования для вывода информации в консоль
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+# Отключаем лишний спам от сторонних библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("JoyBot")
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0"} # Заголовок для обхода блокировок при парсинге
 
+# Настройка HTTP-клиента для Telegram API (увеличиваем тайм-ауты для тяжелых файлов)
 request = HTTPXRequest(
     connect_timeout=60,
     read_timeout=120,
@@ -56,22 +61,25 @@ request = HTTPXRequest(
     pool_timeout=60
 )
 
-# Настройки Rich Message и сворачивания (Bot API 10.1-10.3)
-MAX_RICH_MEDIA = 50           # Лимит медиавложений в одном Rich Message
-LIMIT_RICH_CHARS = 30000      # Безопасный лимит символов в Rich Message (максимум API: 32 768)
-PREVIEW_MAX_MEDIA = 4         # Сколько медиа показывать открытыми до кнопки разворачивания
-PREVIEW_MAX_CHARS = 600       # Сколько символов текста показывать открытыми до кнопки разворачивания
-LIMIT_TEXT_MSG = 4000         # Лимит обычного сообщения при фолбэке
-MAX_MEDIA_PER_GROUP = 10      # Лимит обычной медиагруппы при фолбэке
-MAX_SEND_RETRIES = 2          # Лимит попыток при сетевых сбоях
+# --- Блок лимитов и ограничений Telegram ---
+MAX_RICH_MEDIA = 50       # Макс. количество медиа в одном Rich-сообщении
+LIMIT_RICH_CHARS = 30000  # Макс. длина текста в Rich Message
+PREVIEW_MAX_MEDIA = 4     # Макс. количество медиа до скрытия под кат (спойлер)
+PREVIEW_MAX_CHARS = 600   # Макс. длина текста до скрытия под кат
+LIMIT_TEXT_MSG = 4000     # Лимит обычного текстового сообщения Telegram
+MAX_MEDIA_PER_GROUP = 10  # Макс. количество файлов в медиагруппе Telegram
+MAX_SEND_RETRIES = 2      # Количество попыток отправки при ошибке
 
-SAVE_FILE = "sent_posts.pkl"
-MAX_POSTS = 50
+# --- Настройки сохранения состояния ---
+SAVE_FILE = "sent_posts.pkl" # Файл для сохранения отправленных ID постов
+MAX_POSTS = 50               # Храним историю последних 50 постов для каждого URL
+# Словарь для хранения истории (чтобы не отправлять одни и те же посты после перезапуска)
 processed_posts = defaultdict(lambda: deque(maxlen=MAX_POSTS))
 recorded_sent_posts = False
 
 
 async def load_sent_posts(app: Application):
+    """Асинхронная функция загрузки истории отправленных постов из файла."""
     global processed_posts
     try:
         async with aiofiles.open(SAVE_FILE, "rb") as file:
@@ -90,6 +98,7 @@ async def load_sent_posts(app: Application):
 
 
 async def save_sent_posts(app: Application):
+    """Асинхронная функция сохранения текущей истории постов в файл (чтобы не потерять при выключении)."""
     normal_dict = {key: list(value) for key, value in processed_posts.items()}
     try:
         async with aiofiles.open(SAVE_FILE, "wb") as file:
@@ -99,6 +108,7 @@ async def save_sent_posts(app: Application):
 
 
 def is_url_fetch_error(e: Exception) -> bool:
+    """Проверяет, связана ли ошибка с тем, что Telegram не смог скачать файл по переданной ссылке."""
     text = str(e).lower()
     url_errors = [
         "webpage_media_empty",
@@ -110,33 +120,22 @@ def is_url_fetch_error(e: Exception) -> bool:
 
 
 def is_retryable_network_error(e: Exception) -> bool:
+    """Проверяет, является ли ошибка временной сетевой проблемой (при которой стоит попробовать еще раз)."""
     if isinstance(e, (TimedOut, NetworkError, RetryAfter)):
         return True
     text = str(e).lower()
     retry_texts = [
-        "timed out",
-        "timeout",
-        "networkerror",
-        "connecterror",
-        "all connection attempts failed",
-        "cannot connect to host",
-        "getaddrinfo failed",
-        "connection reset",
-        "server disconnected",
-        "retry after",
-        "flood control",
-        "bad gateway",
-        "gateway timeout",
-        "internal server error",
+        "timed out", "timeout", "networkerror", "connecterror",
+        "all connection attempts failed", "cannot connect to host",
+        "getaddrinfo failed", "connection reset", "server disconnected",
+        "retry after", "flood control", "bad gateway",
+        "gateway timeout", "internal server error",
     ]
     return any(t in text for t in retry_texts)
 
 
 def normalize_url(url: str) -> str:
-    """
-    Приводит URL к полному виду https://... и корректно экранирует кириллицу,
-    пробелы и скобки в пути файла, чтобы парсер Telegram не терял картинки.
-    """
+    """Приводит спарсенные ссылки к правильному формату (добавляет https, кодирует спецсимволы)."""
     if not url:
         return ""
     url = url.strip()
@@ -147,7 +146,6 @@ def normalize_url(url: str) -> str:
 
     try:
         parts = urlsplit(url)
-        # Сначала раскодируем (на случай если часть строки уже в %D0...), затем чисто кодируем весь путь
         clean_path = quote(unquote(parts.path), safe="/:@-._~")
         clean_query = quote(unquote(parts.query), safe="=&?/:@-._~")
         return urlunsplit((parts.scheme, parts.netloc, clean_path, clean_query, parts.fragment))
@@ -155,16 +153,28 @@ def normalize_url(url: str) -> str:
         return url
 
 
+def clean_iframe_url(iframe_url: str) -> str:
+    """Очищает и адаптирует ссылки на сторонние плееры (YouTube, Coub, Vimeo) для нормального отображения в Telegram."""
+    parsed = urlparse(iframe_url)
+    clean_url = f"https://{parsed.netloc}{parsed.path}"
+    if "youtube.com" in clean_url:
+        clean_url = clean_url.replace("/embed/", "/watch?v=")
+    elif "coub.com" in clean_url:
+        clean_url = clean_url.replace("/embed/", "/view/")
+    elif "vimeo.com" in clean_url:
+        clean_url = clean_url.replace("/video/", "/")
+    return clean_url
+
+
 def extract_media_from_image_div(img_div: Tag) -> list[dict]:
     """
-    Извлекает медиа из div.image (поддерживает и старую, и новую верстку zoomed-image).
-    Сохраняет как full_url (оригинал), так и preview_url (сжатая копия 811px, которая
-    гарантированно и быстро скачивается серверами Telegram).
+    Анализирует HTML-блок с картинкой/видео/гифкой.
+    Находит все медиаисточники и возвращает список словарей с их типами и URL-адресами.
     """
     found = []
     has_specific = False
 
-    # 1. Видео (mp4)
+    # Поиск обычных видео
     for video_span in img_div.find_all('span', class_='video_holder'):
         has_specific = True
         source = video_span.find('source', type="video/mp4") or video_span.find('source')
@@ -172,7 +182,7 @@ def extract_media_from_image_div(img_div: Tag) -> list[dict]:
             url = normalize_url(source.get('src'))
             found.append({"id": str(uuid.uuid4()), "type": "video", "data": url, "send": "not"})
 
-    # 2. Гифки / Webm-видео
+    # Поиск GIF-анимаций (на JoyReactor они часто перекодированы в MP4)
     for gif_span in img_div.find_all('span', class_='video_gif_holder'):
         has_specific = True
         source = gif_span.find('source', type="video/mp4")
@@ -184,17 +194,24 @@ def extract_media_from_image_div(img_div: Tag) -> list[dict]:
             url = normalize_url(a_tag.get('href'))
             found.append({"id": str(uuid.uuid4()), "type": "gif", "data": url, "send": "not"})
 
+    # Поиск встроенных плееров (iframe)
+    for iframe in img_div.find_all('iframe'):
+        has_specific = True
+        iframe_url = iframe.get('src')
+        if iframe_url:
+            c_url = clean_iframe_url(iframe_url)
+            found.append({"id": str(uuid.uuid4()), "type": "video_hosting", "data": c_url, "send": "not"})
+
     if has_specific:
         return found
 
-    # 3. Картинки
+    # Резервный поиск обычных картинок (полное изображение и превью)
     a_full = img_div.find('a', href=True)
     img_el = img_div.find('img', src=True)
 
     full_url = normalize_url(a_full['href']) if a_full else ""
     preview_url = normalize_url(img_el['src']) if img_el else ""
 
-    # Если ссылка ведет на .webp, заменяем для превью/отправки или берем preview_url
     chosen_full = full_url or preview_url
     chosen_preview = preview_url or full_url
 
@@ -211,7 +228,10 @@ def extract_media_from_image_div(img_div: Tag) -> list[dict]:
 
 
 def format_inline_element(node) -> str:
-    """Форматирует строчные элементы внутри абзаца, сохраняя ссылки и жирность."""
+    """
+    Рекурсивно проходит по HTML-тегам внутри текста и переводит их в формат,
+    который поддерживает Telegram (жирный, курсив, ссылки).
+    """
     if isinstance(node, NavigableString):
         return html.escape(str(node))
     if not isinstance(node, Tag):
@@ -233,22 +253,26 @@ def format_inline_element(node) -> str:
     if node.name in ("i", "em"):
         inner = "".join(format_inline_element(c) for c in node.children).strip()
         return f"<i>{inner}</i>" if inner else ""
+    if node.name in ("figure", "img", "video", "p"):
+        return str(node)
 
     return "".join(format_inline_element(c) for c in node.children)
 
 
 def extract_flow_from_container(container: Tag, flow_blocks: list[dict], media_list: list[dict]):
     """
-    Рекурсивно обходит контейнер поста сверху вниз (включая таблицы <table>/<tr>/<td>,
-    в которые авторы JoyReactor часто кладут картинки!) и собирает единый поток блоков.
+    Основная логика парсинга контента поста. Проходит по дереву HTML и разбивает
+    содержимое на блоки (текст, заголовки, медиа), игнорируя мусорные элементы.
     """
     for child in container.children:
+        # Обработка чистого текста без тегов
         if isinstance(child, NavigableString):
             text = str(child).strip()
             if text:
                 for line in text.split("\n"):
                     if line.strip():
-                        flow_blocks.append({"kind": "text", "html": html.escape(line.strip()), "chars": len(line.strip())})
+                        flow_blocks.append(
+                            {"kind": "text", "html": html.escape(line.strip()), "chars": len(line.strip())})
             continue
 
         if not isinstance(child, Tag):
@@ -256,19 +280,19 @@ def extract_flow_from_container(container: Tag, flow_blocks: list[dict], media_l
 
         classes = child.get("class") or []
 
-        # Пропускаем служебные элементы интерфейса сайта
+        # Игнорируем кнопки, скрипты, элементы управления
         if (
-            "collapse-content-button" in classes
-            or "expandable-post-content" in classes
-            or "post-footer" in classes
-            or "post-header" in classes
-            or "post-tags" in classes
-            or "absolute" in classes
-            or child.name in ("button", "svg", "script", "style")
+                "collapse-content-button" in classes
+                or "expandable-post-content" in classes
+                or "post-footer" in classes
+                or "post-header" in classes
+                or "post-tags" in classes
+                or "absolute" in classes
+                or child.name in ("button", "svg", "script", "style")
         ):
             continue
 
-        # Если сам элемент — блок с картинкой/видео
+        # Обработка изображений/видео
         if "image" in classes:
             extracted = extract_media_from_image_div(child)
             for m in extracted:
@@ -276,24 +300,17 @@ def extract_flow_from_container(container: Tag, flow_blocks: list[dict], media_l
                 flow_blocks.append({"kind": "media", "media": m})
             continue
 
-        # Если сам элемент — iframe
+        # Обработка вложенных iframe
         if child.name == "iframe":
             iframe_url = child.get("src")
             if iframe_url:
-                parsed = urlparse(iframe_url)
-                clean_url = f"https://{parsed.netloc}{parsed.path}"
-                if "youtube.com" in clean_url:
-                    clean_url = clean_url.replace("/embed/", "/watch?v=")
-                elif "coub.com" in clean_url:
-                    clean_url = clean_url.replace("/embed/", "/view/")
-                elif "vimeo.com" in clean_url:
-                    clean_url = clean_url.replace("/video/", "/")
-                m = {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"}
+                c_url = clean_iframe_url(iframe_url)
+                m = {"id": str(uuid.uuid4()), "type": "video_hosting", "data": c_url, "send": "not"}
                 media_list.append(m)
                 flow_blocks.append({"kind": "media", "media": m})
             continue
 
-        # Заголовки (h1-h4)
+        # Обработка заголовков
         if child.name in ("h1", "h2", "h3", "h4"):
             heading_text = child.get_text(" ", strip=True)
             if heading_text:
@@ -305,22 +322,21 @@ def extract_flow_from_container(container: Tag, flow_blocks: list[dict], media_l
                 })
             continue
 
-        # ВАЖНО: Если внутри ЛЮБОГО контейнера (div, table, tbody, tr, td, p, span)
-        # есть вложенные картинки div.image, iframe или подзаголовки — идем внутрь рекурсивно!
+        # Если внутри блока есть другие блоки - рекурсивный вызов
         has_nested_media_or_blocks = (
-            child.find("div", class_="image") is not None
-            or child.find(["h1", "h2", "h3", "h4", "iframe", "table", "p"]) is not None
-            or child.name in ("table", "tbody", "thead", "tr", "td", "th", "article", "section")
-            or "post-content" in classes
-            or "post_content" in classes
-            or "expand-wrapper" in classes
-            or "single" in classes
+                child.find("div", class_="image") is not None
+                or child.find(["h1", "h2", "h3", "h4", "iframe", "table", "p"]) is not None
+                or child.name in ("table", "tbody", "thead", "tr", "td", "th", "article", "section")
+                or "post-content" in classes
+                or "post_content" in classes
+                or "expand-wrapper" in classes
+                or "single" in classes
         )
         if has_nested_media_or_blocks and child.name not in ("a", "b", "strong", "i", "em"):
             extract_flow_from_container(child, flow_blocks, media_list)
             continue
 
-        # Обычный текстовый абзац
+        # Финальная обработка инлайн-элементов (ссылки, жирный текст и т.д.)
         inline_html = "".join(format_inline_element(c) for c in child.children).strip()
         if inline_html:
             for line in inline_html.split("\n"):
@@ -331,23 +347,17 @@ def extract_flow_from_container(container: Tag, flow_blocks: list[dict], media_l
 
 
 def extract_post_tags(post: Tag) -> list[str] | None:
-    """
-    Извлекает теги поста в правильном порядке (поддерживает и старый <h2>,
-    и новый <div class="post-tags"> без мусорного многоточия '...').
-    Возвращает None, если найден нежелательный тег из UNWANTED_TAGS.
-    """
+    """Извлекает теги из поста. Если найден тег из черного списка (UNWANTED_TAGS), возвращает None, чтобы пропустить пост."""
     tags = []
-
-    # 1. Пробуем новую верстку: <div class="post-tags"> -> <span class="ant-tag"><a>...</a></span>
     post_tags_div = post.find("div", class_=lambda c: c and "post-tags" in c)
     if post_tags_div:
         for a_tag in post_tags_div.find_all("a"):
             t = a_tag.get_text(strip=True)
             if t and t != "...":
                 tags.append(t)
-        post_tags_div.decompose()
+        post_tags_div.decompose() # Удаляем теги из DOM дерева, чтобы они не попали в текст поста
 
-    # 2. Пробуем старую верстку: <h2>
+    # Дополнительный поиск тегов в заголовках H2
     for h2 in post.find_all("h2"):
         raw_text = h2.get_text(", ", strip=True)
         if raw_text:
@@ -357,7 +367,7 @@ def extract_post_tags(post: Tag) -> list[str] | None:
                     tags.append(t_clean)
         h2.decompose()
 
-    # Проверяем на UNWANTED_TAGS
+    # Проверка по блэклисту
     for t in tags:
         if any(unwanted.lower() in t.lower() for unwanted in UNWANTED_TAGS if unwanted):
             return None
@@ -365,32 +375,25 @@ def extract_post_tags(post: Tag) -> list[str] | None:
     return tags
 
 
-def extract_best_comments(post: Tag) -> tuple[list[str], list[dict]]:
-    """
-    Извлекает лучшие комментарии как из старой верстки (div#best_comment_...),
-    так и из новой (h3.best-comment-header и дерево ответов под ним).
-    Пропускает скрытые заминусованные комментарии ('Коммент скрыт. Показать?').
-    """
+def extract_best_comments(post: Tag, comment_media: list) -> list[str]:
+    """Извлекает блок 'Отличный комментарий' из поста, собирает авторов, текст и медиа внутри комментов."""
     comments_text_list = []
-    comment_media = []
-
-    # Находим контейнеры лучших комментариев (старая и новая верстка)
     candidate_comments = []
+
+    # Поиск комментариев по специфичным для сайта ID или заголовкам
     old_best = post.find_all('div', id=lambda x: x and x.startswith('best_comment_'))
     if old_best:
         candidate_comments.extend(old_best)
     else:
-        # В новой верстке ищем заголовок "Отличный комментарий!"
         best_header = post.find(lambda tag: tag.name in ("h3", "div") and "Отличный комментарий" in tag.get_text())
         if best_header:
-            # Берем родительский блок ветки лучших комментариев
             branch_root = best_header.find_parent("div", class_="pt-1") or best_header.find_parent("div")
             if branch_root:
                 candidate_comments.extend(branch_root.find_all("div", class_=lambda c: c and "comment" in c.split()))
 
     if candidate_comments:
         for comment in candidate_comments:
-            # Пропускаем скрытые комментарии
+            # Игнорируем скрытые (заминусованные) комментарии
             if comment.find("div", class_="comment-hidden"):
                 continue
             content_div = comment.find('div', class_='comment-content')
@@ -399,14 +402,13 @@ def extract_best_comments(post: Tag) -> tuple[list[str], list[dict]]:
             if "Нажмите, чтобы показать" in content_div.get_text() or "Коммент скрыт" in content_div.get_text():
                 continue
 
-            # Имя автора в старой и новой верстке
+            # Получение имени автора
             author = "Аноним"
             user_block = comment.find(class_='comment-username') or comment.find(class_='comment_username')
             if user_block:
                 if user_block.name == "a":
                     author = html.escape(user_block.get_text(strip=True))
                 else:
-                    # В новой верстке внутри div.comment-username несколько ссылок, берем ту, где текст имени
                     links = user_block.find_all("a")
                     for l in links:
                         txt = l.get_text(strip=True)
@@ -414,98 +416,119 @@ def extract_best_comments(post: Tag) -> tuple[list[str], list[dict]]:
                             author = html.escape(txt)
                             break
 
-            has_media = False
+            # Обработка видео (iframe) внутри комментариев
             for iframe in content_div.find_all('iframe'):
                 iframe_url = iframe.get('src')
                 if iframe_url:
-                    parsed = urlparse(iframe_url)
-                    clean_url = f"https://{parsed.netloc}{parsed.path}"
-                    if 'youtube.com' in clean_url:
-                        clean_url = clean_url.replace('/embed/', '/watch?v=')
-                    elif 'coub.com' in clean_url:
-                        clean_url = clean_url.replace('/embed/', '/view/')
-                    elif 'vimeo.com' in clean_url:
-                        clean_url = clean_url.replace('/video/', '/')
+                    c_url = clean_iframe_url(iframe_url)
                     comment_media.append(
-                        {"id": str(uuid.uuid4()), "type": "video_hosting", "data": clean_url, "send": "not"}
-                    )
-                    has_media = True
-                iframe.decompose()
+                        {"id": str(uuid.uuid4()), "type": "video_hosting", "data": c_url, "send": "not"})
+                    new_tag = BeautifulSoup(f'<p>📺 <a href="{html.escape(c_url)}">Смотреть видео</a></p>',
+                                            "html.parser")
+                    iframe.replace_with(new_tag)
+                else:
+                    iframe.decompose()
 
+            # Обработка картинок/гифок внутри комментариев
             for img_div in content_div.find_all('div', class_='image'):
                 extracted = extract_media_from_image_div(img_div)
-                if extracted:
-                    comment_media.extend(extracted)
-                    has_media = True
-                img_div.decompose()
+                media_htmls = ["<br>"]
+                for m in extracted:
+                    comment_media.append(m)
+                    url = html.escape(m.get("preview_url", m["data"]))
+                    # Формируем HTML для отображения картинки в комментарии
+                    if m["type"] in ("photo", "gif"):
+                        media_htmls.append(f'<figure><img src="{url}"></figure>')
+                    elif m["type"] == "video":
+                        media_htmls.append(f'<figure><video src="{url}"></video></figure>')
+                    elif m["type"] == "video_hosting":
+                        media_htmls.append(f'<p>📺 <a href="{url}">Смотреть видео</a></p>')
 
-            comment_text = content_div.get_text(separator=" ", strip=True)
-            if comment_text:
-                entry = f"👤 <b>{author}</b>: {html.escape(comment_text)}"
-                if entry not in comments_text_list:
-                    comments_text_list.append(entry)
-            elif has_media:
-                entry = f"👤 <b>{author}</b>: <i>[Прикрепленный медиафайл]</i>"
+                if len(media_htmls) > 1:
+                    new_tag = BeautifulSoup("".join(media_htmls), "html.parser")
+                    img_div.replace_with(new_tag)
+                else:
+                    img_div.decompose()
+
+            # Преобразование текста комментария
+            comment_html = "".join(format_inline_element(c) for c in content_div.children).strip()
+            comment_html = "\n".join(line for line in comment_html.split("\n") if line.strip())
+
+            if comment_html:
+                entry = f"👤 <b>{author}</b>: {comment_html}"
                 if entry not in comments_text_list:
                     comments_text_list.append(entry)
 
     if comments_text_list:
         logger.info(f"Парсинг: Найдено отличных комментариев - {len(comments_text_list)}")
 
-    # Удаляем все блоки комментариев из поста, чтобы они не попали в основной текст
+    # Удаляем деревья комментариев, чтобы они не попали в основной текст поста
     for comment_list in post.find_all('div', class_='post_comment_list'):
         comment_list.decompose()
-    for c_div in post.find_all('div', class_=lambda c: c and ('comment' in c.split() or 'comment-with-indentation' in c.split())):
+    for c_div in post.find_all('div', class_=lambda c: c and (
+            'comment' in c.split() or 'comment-with-indentation' in c.split())):
         c_div.decompose()
 
-    return comments_text_list, comment_media
+    return comments_text_list
 
 
 def parse_joy_post(post: Tag) -> dict | None:
+    """Центральная функция парсинга: собирает теги, текст, медиа и комментарии в единый словарь."""
     tags_list = extract_post_tags(post)
     if tags_list is None:
-        return None  # Пост отфильтрован по UNWANTED_TAGS
-
-    comments_list, comment_media = extract_best_comments(post)
+        return None # Если в посте есть запрещенный тег, пропускаем его
 
     post_data = {
         "tags_html": ", ".join(f"<code>{html.escape(t)}</code>" for t in tags_list) if tags_list else "",
         "flow_blocks": [],
-        "comments": comments_list,
+        "comments": [],
         "content": []
     }
 
+    post_data["comments"] = extract_best_comments(post, post_data["content"])
+
     post_content_div = (
-        post.find('div', class_='post-content')
-        or post.find('div', class_='post_content')
-        or post
+            post.find('div', class_='post-content')
+            or post.find('div', class_='post_content')
+            or post
     )
     extract_flow_from_container(post_content_div, post_data["flow_blocks"], post_data["content"])
-
-    for cm in comment_media:
-        post_data["content"].append(cm)
-        post_data["flow_blocks"].append({"kind": "media", "media": cm, "from_comment": True})
 
     return post_data
 
 
 def render_media_block_html(media_item: dict, use_preview_url: bool = True) -> str:
-    """
-    Рендерит медиафайл в HTML-тег для Rich Message.
-    По умолчанию для Rich Message используем preview_url (сжатую версию 811px с CDN реактора),
-    так как тяжелые 8МБ full-оригиналы сервер Telegram часто не успевает скачать по таймауту!
-    """
+    """Вспомогательная функция для создания HTML-тегов для Rich Messages (figure, img, video)."""
     m_type = media_item["type"]
-    url = media_item.get("preview_url", media_item["data"]) if use_preview_url else media_item["data"]
-    safe_url = html.escape(url)
+    url = html.escape(media_item.get("preview_url", media_item["data"]) if use_preview_url else media_item["data"])
 
     if m_type == "photo":
-        return f'<figure><img src="{safe_url}"></figure>'
-    elif m_type in ("video", "gif"):
-        return f'<figure><img src="{safe_url}"></figure>'
+        return f'<figure><img src="{url}"></figure>'
+    elif m_type == "gif":
+        return f'<figure><img src="{url}"></figure>'
+    elif m_type == "video":
+        return f'<figure><video src="{url}"></video></figure>'
     elif m_type == "video_hosting":
-        return f'<p>📺 <a href="{safe_url}">Смотреть видео ({safe_url})</a></p>'
+        return f'<p>📺 <a href="{url}">Смотреть видео</a></p>'
     return ""
+
+
+def split_long_paragraph_html(html_text: str, max_len: int = PREVIEW_MAX_CHARS) -> tuple[str, str]:
+    """Разбивает длинный параграф текста на две части, чтобы спрятать хвост под кат <details>."""
+    if len(html_text) <= max_len:
+        return html_text, ""
+    split_pos = html_text.rfind(" ", int(max_len * 0.5), max_len)
+    if split_pos == -1:
+        split_pos = max_len
+
+    open_a = html_text.rfind("<a ", 0, split_pos)
+    close_a = html_text.rfind("</a>", 0, split_pos)
+    if open_a != -1 and (close_a == -1 or open_a > close_a):
+        end_a = html_text.find("</a>", split_pos)
+        if end_a != -1:
+            split_pos = end_a + 4
+
+    return html_text[:split_pos].strip() + "...", html_text[split_pos:].strip()
 
 
 def build_rich_html(
@@ -514,10 +537,10 @@ def build_rich_html(
     use_preview_urls: bool = True,
     include_media_inline: bool = True,
     partial_warning: bool = False
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """
-    Собирает единый Rich Message:
-    Возвращает (html_string, expected_inline_media_count).
+    Генерирует сложный HTML-код для нового формата сообщений Telegram (Rich Media).
+    Распределяет медиа и текст на видимую часть и скрытую (внутри тега <details>).
     """
     flow_blocks = post_data.get("flow_blocks", [])
     tags_html = post_data.get("tags_html", "")
@@ -528,6 +551,7 @@ def build_rich_html(
 
     shown_media_count = 0
     total_media_count = 0
+    expected_cdn_media = 0
     hidden_media_count = 0
 
     shown_chars_count = 0
@@ -553,7 +577,10 @@ def build_rich_html(
                 continue
 
             total_media_count += 1
+            if block["media"]["type"] in ("photo", "video", "gif"):
+                expected_cdn_media += 1
 
+            # Если превышен лимит отображаемых медиа - прячем остальные в <details>
             if is_folding or shown_media_count >= PREVIEW_MAX_MEDIA:
                 is_folding = True
                 hidden_html_parts.append(media_html)
@@ -568,16 +595,32 @@ def build_rich_html(
                 break
             total_chars_count += b_chars
 
-            block_html = block["html"] if kind == "heading" else f"<p>{block['html']}</p>"
-
-            if is_folding or (shown_chars_count > 0 and shown_chars_count + b_chars > PREVIEW_MAX_CHARS):
-                is_folding = True
-                hidden_html_parts.append(block_html)
-                hidden_chars_count += b_chars
+            if kind == "heading":
+                if is_folding:
+                    hidden_html_parts.append(block["html"])
+                    hidden_chars_count += b_chars
+                else:
+                    visible_html_parts.append(block["html"])
+                    shown_chars_count += b_chars
             else:
-                visible_html_parts.append(block_html)
-                shown_chars_count += b_chars
+                # Логика разбивки слишком длинного текста
+                if not is_folding and shown_chars_count + b_chars <= PREVIEW_MAX_CHARS:
+                    visible_html_parts.append(f"<p>{block['html']}</p>")
+                    shown_chars_count += b_chars
+                elif not is_folding and shown_chars_count == 0 and b_chars > PREVIEW_MAX_CHARS:
+                    head_part, tail_part = split_long_paragraph_html(block["html"], PREVIEW_MAX_CHARS)
+                    visible_html_parts.append(f"<p>{head_part}</p>")
+                    shown_chars_count += len(head_part)
+                    if tail_part:
+                        is_folding = True
+                        hidden_html_parts.append(f"<p>{tail_part}</p>")
+                        hidden_chars_count += len(tail_part)
+                else:
+                    is_folding = True
+                    hidden_html_parts.append(f"<p>{block['html']}</p>")
+                    hidden_chars_count += b_chars
 
+    # Сборка финального HTML-кода
     result_blocks = []
     result_blocks.extend(visible_html_parts)
 
@@ -589,10 +632,7 @@ def build_rich_html(
             summary_stats.append(f"{hidden_chars_count} симв. текста")
 
         stats_str = f" ({', '.join(summary_stats)})" if summary_stats else ""
-        if hidden_chars_count > 0:
-            summary_title = f"Читать далее{stats_str}..."
-        else:
-            summary_title = f"Показать остальные медиа{stats_str}..."
+        summary_title = f"Читать далее{stats_str}..." if hidden_chars_count > 0 else f"Показать остальные медиа{stats_str}..."
 
         hidden_joined = "\n".join(hidden_html_parts)
         result_blocks.append(f"<details><summary>{summary_title}</summary>\n{hidden_joined}\n</details>")
@@ -601,9 +641,9 @@ def build_rich_html(
         result_blocks.append(f"<p>{tags_html}</p>")
 
     if comments:
-        comments_p = "\n".join(f"<p>{c}</p>" for c in comments)
+        comments_p = "\n<br>\n".join(f"<p>{c}</p>" for c in comments)
         result_blocks.append("<p>💬 <b>Отличные комментарии:</b></p>")
-        if len(comments) > 3 or sum(len(c) for c in comments) > 400:
+        if len(comments) > 3 or sum(len(c) for c in comments) > 400 or "<figure>" in comments_p:
             result_blocks.append(f"<blockquote expandable>\n{comments_p}\n</blockquote>")
         else:
             result_blocks.append(f"<blockquote>\n{comments_p}\n</blockquote>")
@@ -614,19 +654,15 @@ def build_rich_html(
     if direct_url:
         result_blocks.append(f'<p><a href="{html.escape(direct_url)}">Пост на JoyReactor</a></p>')
 
-    return "\n".join(result_blocks), total_media_count
+    return "\n".join(result_blocks), expected_cdn_media, total_media_count
 
 
 def verify_rich_message_has_media(resp_json: dict) -> bool:
-    """
-    Проверяет ответ Telegram API: действительно ли сервер Telegram скачал и встроил
-    картинки в Rich Message, или он молча пропустил <figure><img ...> из-за блокировки CDN.
-    """
+    """Проверяет ответ Telegram API, чтобы убедиться, что сервер успешно обработал и скачал переданные URL картинок."""
     try:
         msg_res = resp_json.get("result", {})
         rich_msg = msg_res.get("rich_message", {})
         raw_str = str(rich_msg).lower()
-        # Ищем признаки наличия медиаблока в дереве RichBlock ответа сервера
         for marker in ("figure", "photo", "image", "media", "video", "file_id"):
             if marker in raw_str:
                 return True
@@ -645,18 +681,17 @@ async def send_rich_message_to_telegram(
     reply_to_message_id: int | None = None
 ) -> tuple[bool, bool]:
     """
-    Отправляет пост через sendRichMessage.
-    Если ожидались встроенные картинки, проверяет, что они реально прогрузились в ответе Telegram.
-    Если Telegram не смог скачать картинки с CDN JoyReactor (опубликовал только текст без фото) —
-    автоматически удаляет неполное сообщение и возвращает (False, False), чтобы бот
-    скачал эти картинки локально и гарантированно отправил их в канал!
+    Отправляет собранный HTML-код в Telegram как специальный Rich Message
+    через прямой POST-запрос к Telegram Bot API.
+    Возвращает (успех_отправки, были_ли_медиа_в_сообщении).
     """
     url = f"https://api.telegram.org/bot{context.bot.token}/sendRichMessage"
 
+    # Попытка отправки сообщения с медиа
     if include_media_inline and post_data.get("content"):
-        # Сначала пробуем легкие preview_url (они качаются быстрее и без таймаутов), затем full_url
+        # Пробуем дважды: с превью-ссылками и полными ссылками
         for use_preview in (True, False):
-            rich_html, expected_media = build_rich_html(
+            rich_html, expected_cdn_media, total_media = build_rich_html(
                 post_data=post_data,
                 direct_url=direct_url,
                 use_preview_urls=use_preview,
@@ -672,12 +707,12 @@ async def send_rich_message_to_telegram(
                     resp = await client.post(url, json=payload)
                     if resp.status_code == 200:
                         resp_data = resp.json()
-                        # Проверяем, не выкинул ли Telegram картинки при загрузке с CDN
-                        if expected_media > 0 and not verify_rich_message_has_media(resp_data):
+                        # Если Telegram вернул 200 OK, но не смог загрузить медиа (ошибка CDN) — удаляем и будем грузить локально
+                        if expected_cdn_media > 0 and not verify_rich_message_has_media(resp_data):
                             sent_msg_id = resp_data.get("result", {}).get("message_id")
                             logger.warning(
-                                f"⚠️ Telegram принял Rich Message (msg_id={sent_msg_id}), но НЕ прогрузил "
-                                f"картинки с CDN ({'preview' if use_preview else 'full'}). Удаляем и качаем локально!"
+                                f"⚠️ Telegram принял Rich Message, но НЕ прогрузил "
+                                f"картинки/видео с CDN. Удаляем и качаем локально!"
                             )
                             if sent_msg_id:
                                 try:
@@ -686,7 +721,7 @@ async def send_rich_message_to_telegram(
                                     pass
                             continue
 
-                        logger.info(f"✅ Rich Message с {expected_media} медиа успешно отправлено")
+                        logger.info(f"✅ Rich Message с {total_media} медиа успешно отправлено")
                         return True, True
                     logger.warning(f"⚠️ sendRichMessage вернул {resp.status_code}: {resp.text}")
             except Exception as e:
@@ -694,8 +729,8 @@ async def send_rich_message_to_telegram(
 
         return False, False
 
-    # Текстовый Rich Message (когда медиа уже отправлены открытыми выше или пост текстовый)
-    rich_html_text, _ = build_rich_html(
+    # Попытка отправки только текста (если медиа не получилось загрузить)
+    rich_html_text, _, _ = build_rich_html(
         post_data=post_data,
         direct_url=direct_url,
         include_media_inline=False,
@@ -715,6 +750,7 @@ async def send_rich_message_to_telegram(
     except Exception as e:
         logger.warning(f"⚠️ Ошибка сети при sendRichMessage (текст): {e}")
 
+    # Если Rich Message совсем сломался, отправляем классическим текстовым сообщением
     await send_fallback_formatted_text(
         context=context,
         chat_id=chat_id,
@@ -727,13 +763,17 @@ async def send_rich_message_to_telegram(
 
 
 async def send_fallback_formatted_text(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: str | int,
-    post_data: dict,
-    direct_url: str,
-    partial_warning: bool = False,
-    reply_to_message_id: int | None = None
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: str | int,
+        post_data: dict,
+        direct_url: str,
+        partial_warning: bool = False,
+        reply_to_message_id: int | None = None
 ):
+    """
+    Резервный метод. Если Rich Message не работает, формирует обычное
+    текстовое сообщение с использованием MarkdownV2/HTML форматирования.
+    """
     tags_html = post_data.get("tags_html", "")
     comments = post_data.get("comments", [])
     flow_blocks = post_data.get("flow_blocks", [])
@@ -808,13 +848,17 @@ async def send_fallback_formatted_text(
 
 
 async def _process_media_group(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: str | int,
-    post_id: str,
-    media_objects: list,
-    related_items: list,
-    caption: str | None = None
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: str | int,
+        post_id: str,
+        media_objects: list,
+        related_items: list,
+        caption: str | None = None
 ) -> tuple[bool, int | None]:
+    """
+    Отправляет массив файлов как "Медиагруппу" (карусель/альбом в Telegram).
+    Так как Telegram поддерживает не более 10 файлов за раз, функция разбивает их на чанки по 10.
+    """
     caption_sent_here = False
     first_msg_id = None
 
@@ -823,6 +867,7 @@ async def _process_media_group(
         chunk_items = related_items[:MAX_MEDIA_PER_GROUP]
         is_last_chunk = len(media_objects) <= MAX_MEDIA_PER_GROUP
 
+        # Добавляем подпись (капшен) только к последнему блоку
         if is_last_chunk and caption:
             first_media = chunk[0]
             if isinstance(first_media, InputMediaPhoto):
@@ -845,17 +890,15 @@ async def _process_media_group(
             related_items = related_items[MAX_MEDIA_PER_GROUP:]
 
             if media_objects:
-                await asyncio.sleep(3)
+                await asyncio.sleep(3) # Пауза перед отправкой следующей десятки файлов
 
         except Exception as e:
+            # Логика обработки ошибок: проверяем, нужно ли перекачивать файл или попробовать позже
             url_err = is_url_fetch_error(e)
             net_retry = is_retryable_network_error(e)
 
             if isinstance(e, TimedOut) and all(it["send"] == "err" for it in chunk_items):
-                logger.warning(
-                    f"Post {post_id}: TimedOut при выгрузке локальных файлов. "
-                    f"Помечаем чанк как отправленный во избежание дублей."
-                )
+                logger.warning(f"Post {post_id}: TimedOut при выгрузке локальных файлов. Помечаем отправленным.")
                 for item in chunk_items:
                     item["send"] = "yes"
                 if is_last_chunk and caption:
@@ -889,36 +932,39 @@ async def _process_media_group(
 
 
 async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post_id: str, post_data: dict):
+    """
+    Главная бизнес-логика отправки поста.
+    Сначала пытается отправить его красивым Rich Message.
+    Если там есть iframe или Telegram сбоит — отправляет медиа группами, а затем текст отдельным реплаем.
+    """
     raw_content_list = post_data.get("content", [])
-    tags_html = post_data.get("tags_html", "")
-    flow_blocks = post_data.get("flow_blocks", [])
-    comments = post_data.get("comments", [])
-
-    direct_url = f"https://m.joyreactor.cc/post/{post_id}"
-    link_post = f'<a href="{direct_url}">Пост на JoyReactor</a>'
 
     truncated_by_limit = len(raw_content_list) > MAX_RICH_MEDIA
     content_list = raw_content_list[:MAX_RICH_MEDIA] if truncated_by_limit else raw_content_list
 
-    has_video_or_gif = any(item["type"] in ("video", "gif") for item in content_list)
+    # Если в посте ЕСТЬ видео-хостинги (YouTube, Vimeo и т.д.), мы не можем использовать Rich Message
+    # для всего поста, так как Rich Message ломает превью плеера.
+    has_video_hosting = any(item["type"] == "video_hosting" for item in content_list)
 
-    # 1. ГЛАВНЫЙ ПУТЬ: Пробуем отправить ВЕСЬ пост одним Rich Message
-    # (теперь с проверкой verify_rich_message_has_media, что Telegram реально загрузил картинки!)
-    if not has_video_or_gif:
+    if not has_video_hosting:
         ok, sent_inline = await send_rich_message_to_telegram(
             context=context,
             chat_id=chat_id,
             post_data=post_data,
-            direct_url=direct_url,
+            direct_url=f"https://m.joyreactor.cc/post/{post_id}",
             include_media_inline=True,
             partial_warning=truncated_by_limit
         )
         if ok and (sent_inline or not content_list):
             return
 
-    # 2. Если сервер Telegram не смог сам скачать картинки с CDN реактора для Rich Message
-    # (или в посте есть mp4/gif), отправляем медиафайлы напрямую (с авто-скачиванием через download_media при webpage_curl_failed),
-    # а следом — Rich Message с текстом, тегами, комментариями и ссылкой!
+    # Логика классической отправки файлов (через send_media_group / send_animation)
+    tags_html = post_data.get("tags_html", "")
+    flow_blocks = post_data.get("flow_blocks", [])
+    comments = post_data.get("comments", [])
+    direct_url = f"https://m.joyreactor.cc/post/{post_id}"
+    link_post = f'<a href="{direct_url}">Пост на JoyReactor</a>'
+
     text_blocks = [b for b in flow_blocks if b["kind"] in ("heading", "text")]
     has_text_or_comments = bool(text_blocks or comments or truncated_by_limit)
 
@@ -941,6 +987,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
             gif_group, gif_items = [], []
             video_hosting_group = []
 
+            # Распределение файлов по типам для правильной отправки
             for content in content_list:
                 if content["send"] == "yes":
                     continue
@@ -950,6 +997,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
 
                 media_type = content["type"]
 
+                # Если Telegram не смог стянуть по URL ("err"), качаем на свой сервер и отправляем локально
                 if content["send"] == "err" and media_type in ("photo", "video", "gif"):
                     if "local_files" not in content:
                         files = await download_media(content["data"])
@@ -966,6 +1014,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                                 everything_sent = False
                             continue
 
+                # Подготовка фото
                 if media_type == "photo":
                     if content["send"] == "not":
                         mixed_media_group.append(InputMediaPhoto(media=content["data"], parse_mode="HTML"))
@@ -977,6 +1026,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                                     mixed_media_group.append(InputMediaPhoto(media=f.read(), parse_mode="HTML"))
                                     mixed_media_items.append(content)
 
+                # Подготовка видео
                 elif media_type == "video":
                     if content["send"] == "not":
                         mixed_media_group.append(InputMediaVideo(media=content["data"], parse_mode="HTML"))
@@ -988,6 +1038,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                                     mixed_media_group.append(InputMediaVideo(media=f.read(), parse_mode="HTML"))
                                     mixed_media_items.append(content)
 
+                # Подготовка GIF (отправляются отдельно, не в медиагруппе)
                 elif media_type == "gif":
                     if content["send"] == "not":
                         gif_group.append(content["data"])
@@ -999,6 +1050,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                                     gif_group.append(f.read())
                                     gif_items.append(content)
 
+                # Ссылки на YouTube/Vimeo (отправляются текстом для генерации превью)
                 elif media_type == "video_hosting":
                     video_hosting_group.append(content)
 
@@ -1015,6 +1067,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
             elif mixed_media_group:
                 last_media_type = "mixed"
 
+            # Отправка собранных фото и видео (в альбоме)
             if mixed_media_group:
                 sent, msg_id = await _process_media_group(
                     context, chat_id, post_id, mixed_media_group, mixed_media_items,
@@ -1025,6 +1078,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                 if msg_id and first_media_msg_id is None:
                     first_media_msg_id = msg_id
 
+            # Отправка GIF (через send_animation)
             if gif_group:
                 for i, (gif_media, item) in enumerate(zip(gif_group, gif_items)):
                     is_last_gif = (i == len(gif_group) - 1)
@@ -1045,14 +1099,12 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                             caption_sent = True
                     except Exception as e:
                         if isinstance(e, TimedOut) and item["send"] == "err":
-                            logger.warning(f"Post {post_id}: TimedOut при отправке локального gif, помечаем отправленным.")
+                            logger.warning(
+                                f"Post {post_id}: TimedOut при отправке локального gif, помечаем отправленным.")
                             item["send"] = "yes"
                             continue
-
                         url_err = is_url_fetch_error(e)
                         net_retry = is_retryable_network_error(e)
-                        logger.error(f"Error in post {post_id} (gif): {e}")
-
                         if item["send"] == "not":
                             item["send"] = "err" if (url_err or net_retry) else "close"
                         elif item["send"] == "err":
@@ -1063,6 +1115,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                         if net_retry:
                             await asyncio.sleep(10)
 
+            # Отправка видеохостингов ссылками с превью
             if video_hosting_group:
                 for i, item in enumerate(video_hosting_group):
                     is_last_vh = (i == len(video_hosting_group) - 1)
@@ -1098,8 +1151,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
                                 item["send"] = "yes"
                                 if current_caption:
                                     caption_sent = True
-                            except Exception as inner_e:
-                                logger.error(f"Fallback error: {inner_e}")
+                            except Exception:
                                 item["send"] = "close"
                         else:
                             net_retry = is_retryable_network_error(e)
@@ -1116,6 +1168,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
         if any(c["send"] == "close" for c in content_list):
             everything_sent = False
 
+        # Отправка оставшегося текста (комменты, длинный текст), отвечая на первое медиа
         if has_text_or_comments or not everything_sent or not caption_sent:
             await send_rich_message_to_telegram(
                 context=context,
@@ -1128,10 +1181,12 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, post
             )
 
     finally:
+        # Очистка временной папки с локально скачанными файлами
         await clear_data_folder()
 
 
 async def fetch_html(url: str) -> str:
+    """Асинхронно скачивает HTML-код страницы сайта."""
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
@@ -1147,6 +1202,10 @@ async def fetch_html(url: str) -> str:
 
 
 async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Функция-воркер (запускается по расписанию).
+    Периодически опрашивает сайты, ищет новые посты, парсит их и вызывает функцию отправки в Telegram.
+    """
     global recorded_sent_posts
     post_id = "0"
     has_new_posts = False
@@ -1157,14 +1216,16 @@ async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
             if not html_text:
                 continue
 
+            # Определение чата, в который пойдет пост
             chat_id = TELEGRAM_CHAT_V if url in URLS_V else TELEGRAM_CHAT_PL
             soup = BeautifulSoup(html_text, "html.parser")
+            # Ищем все блоки с постами
             posts = soup.find_all("div", class_=lambda c: c and ("postContainer" in c or "content" in c.split()))
 
             for post in posts:
+                # Получаем ID поста для защиты от дублирования
                 post_id_full = post.get("id")
                 if not post_id_full or "postContainer" not in post_id_full:
-                    # В новой верстке ID поста также можно достать из ссылки в post-footer
                     footer_link = post.find("div", class_="post-footer")
                     a_post = footer_link.find("a", href=lambda h: h and "/post/" in h) if footer_link else None
                     if a_post:
@@ -1174,22 +1235,27 @@ async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     post_id = post_id_full.split("postContainer")[-1].strip('"')
 
+                # Если пост новый (не найден в истории) - обрабатываем его
                 if post_id not in processed_posts[url]:
                     processed_posts[url].append(post_id)
                     has_new_posts = True
                     recorded_sent_posts = True
 
+                    # Запускаем парсинг
                     post_data = parse_joy_post(post)
+                    # Если есть хоть какой-то контент — отправляем в Telegram
                     if post_data and (post_data["content"] or post_data["flow_blocks"] or post_data["comments"]):
                         try:
                             await send_post(context, chat_id=chat_id, post_id=post_id, post_data=post_data)
                         except Exception as send_err:
                             logger.error(f"Unhandled error sending post {post_id}: {send_err}")
 
+                        # Сохраняем прогресс и делаем паузу, чтобы не спамить в Telegram
                         await save_sent_posts(context.application)
                         recorded_sent_posts = False
                         await asyncio.sleep(5)
 
+        # Сохранение после прохода всех URL
         if not has_new_posts and recorded_sent_posts:
             await save_sent_posts(context.application)
             recorded_sent_posts = False
@@ -1198,7 +1264,9 @@ async def monitor_website(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in monitor_website (last post {post_id}): {e}")
 
 
+# --- Точка входа в приложение (запуск скрипта) ---
 if __name__ == "__main__":
+    # Настраиваем защиту от флуда в Telegram (Rate Limiter)
     rate_limiter = AIORateLimiter(
         overall_max_rate=30,
         overall_time_period=1,
@@ -1206,17 +1274,20 @@ if __name__ == "__main__":
         max_retries=3
     )
 
+    # Инициализация ядра бота (Application Builder)
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .request(request)
         .rate_limiter(rate_limiter)
-        .post_init(load_sent_posts)
-        .post_shutdown(save_sent_posts)
+        .post_init(load_sent_posts)     # Загружаем базу при старте
+        .post_shutdown(save_sent_posts) # Сохраняем базу при выключении
         .build()
     )
 
+    # Добавляем задачу мониторинга сайтов в Job Queue (каждые 60 секунд)
     application.job_queue.run_repeating(monitor_website, interval=60, first=1)
 
     logger.info("Bot started via PTB Application")
+    # Запуск бесконечного цикла (прослушка команд и выполнение заданий)
     application.run_polling(drop_pending_updates=True)
